@@ -241,6 +241,125 @@ def _decode_attn_kernel(
              (acc / l_i).to(out_ptr.dtype.element_ty), mask=lane_mask)
 
 
+@triton.jit
+def _split_attn_kernel(
+    q_ptr, k_ptr, v_ptr, acc_ptr, stat_ptr, pos_ptr,
+    heads, kv_heads, capacity, head_dim, groups, scale, splits,
+    BLOCK_N: tl.constexpr, D_BLOCK: tl.constexpr,
+):
+    """One program per (batch, query head, split) over a slice of the keys.
+
+    The single-program kernel launches batch * query_heads programs, which is
+    32 at batch 1 - a quarter of this device's SMs, most of them idle while a
+    few stream the whole cache. Splitting the key range gives the scheduler
+    splits times as much to place, at the cost of a second pass to merge the
+    partial softmaxes.
+
+    Each program emits its partial accumulator plus the running max and sum
+    that the merge needs to reweight it.
+    """
+    pid = tl.program_id(0)
+    split = pid % splits
+    head_id = (pid // splits) % heads
+    batch_id = pid // (splits * heads)
+    kv_head = head_id // groups
+
+    lane = tl.arange(0, D_BLOCK)
+    lane_mask = lane < head_dim
+
+    q = tl.load(q_ptr + (batch_id * heads + head_id) * head_dim + lane,
+                mask=lane_mask, other=0.0).to(tl.float32)
+
+    length = tl.load(pos_ptr) + 1
+    # Ceiling division, so the final split takes the short remainder.
+    per_split = (length + splits - 1) // splits
+    begin = split * per_split
+    end = tl.minimum(begin + per_split, length)
+
+    kv_base = (batch_id * kv_heads + kv_head) * capacity * head_dim
+    m_i = float("-inf")
+    l_i = 0.0
+    acc = tl.zeros([D_BLOCK], dtype=tl.float32)
+
+    for start in range(begin, end, BLOCK_N):
+        idx = start + tl.arange(0, BLOCK_N)
+        key_mask = idx < end
+        offsets = kv_base + idx[:, None] * head_dim + lane[None, :]
+        both = key_mask[:, None] & lane_mask[None, :]
+
+        k = tl.load(k_ptr + offsets, mask=both, other=0.0).to(tl.float32)
+        scores = tl.sum(q[None, :] * k, axis=1) * scale
+        scores = tl.where(key_mask, scores, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+
+        v = tl.load(v_ptr + offsets, mask=both, other=0.0).to(tl.float32)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        m_i = m_new
+
+    tl.store(acc_ptr + pid * head_dim + lane, acc, mask=lane_mask)
+    tl.store(stat_ptr + pid * 2, m_i)
+    tl.store(stat_ptr + pid * 2 + 1, l_i)
+
+
+@triton.jit
+def _merge_splits_kernel(
+    acc_ptr, stat_ptr, out_ptr, head_dim, splits, D_BLOCK: tl.constexpr,
+):
+    """Combine the per-split partial softmaxes into one output row.
+
+    Standard rescale: shift every split onto the global max, weight its
+    accumulator by exp(m_split - m_global), and divide by the summed mass. A
+    split that saw no keys contributes m = -inf and l = 0, which drops out.
+    """
+    pid = tl.program_id(0)
+    lane = tl.arange(0, D_BLOCK)
+    lane_mask = lane < head_dim
+
+    m_global = float("-inf")
+    for s in range(0, splits):
+        m_global = tl.maximum(m_global, tl.load(stat_ptr + (pid * splits + s) * 2))
+
+    acc = tl.zeros([D_BLOCK], dtype=tl.float32)
+    total = 0.0
+    for s in range(0, splits):
+        m_s = tl.load(stat_ptr + (pid * splits + s) * 2)
+        l_s = tl.load(stat_ptr + (pid * splits + s) * 2 + 1)
+        weight = tl.where(l_s > 0.0, tl.exp(m_s - m_global), 0.0)
+        part = tl.load(acc_ptr + (pid * splits + s) * head_dim + lane,
+                       mask=lane_mask, other=0.0)
+        acc += part * weight
+        total += l_s * weight
+
+    tl.store(out_ptr + pid * head_dim + lane,
+             (acc / total).to(out_ptr.dtype.element_ty), mask=lane_mask)
+
+
+def decode_attention_split(q, cache_k, cache_v, pos, heads, kv_heads, scale, splits=8):
+    """Split-K decode attention, for shapes too small to fill the device."""
+    batch, _, _, head_dim = q.shape
+    capacity = cache_k.shape[2]
+    programs = batch * heads * splits
+
+    partial = torch.empty(programs, head_dim, dtype=torch.float32, device=q.device)
+    stats = torch.empty(programs, 2, dtype=torch.float32, device=q.device)
+    out = torch.empty(batch, 1, heads * head_dim, dtype=q.dtype, device=q.device)
+
+    d_block = triton.next_power_of_2(head_dim)
+    _split_attn_kernel[(programs,)](
+        q, cache_k, cache_v, partial, stats, pos,
+        heads, kv_heads, capacity, head_dim, heads // kv_heads, scale, splits,
+        BLOCK_N=64, D_BLOCK=d_block, num_warps=4,
+    )
+    _merge_splits_kernel[(batch * heads,)](
+        partial, stats, out, head_dim, splits, D_BLOCK=d_block, num_warps=4,
+    )
+    return out
+
+
 def decode_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale):
     """Attention for one decode token against a fixed-capacity cache.
 

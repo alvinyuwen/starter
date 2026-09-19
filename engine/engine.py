@@ -45,10 +45,11 @@ try:
         swiglu as _k_swiglu,
         decode_attention as _k_attn,
         norm_rope as _k_norm_rope,
+        decode_attention_split as _k_attn_split,
     )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = None
 
 
 class _Ready:
@@ -194,6 +195,7 @@ class Engine:
         self.fused_rope = False
         self.fused_swiglu = False
         self.fused_attn = False
+        self.split_attn = False
         self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
@@ -293,22 +295,24 @@ class Engine:
             # only an end-to-end step prices that in.
             candidates = []
             if self.fused_attn:
-                candidates.append(("triton", True, supports_gqa))
+                candidates.append(("triton", True, False, supports_gqa))
+            if getattr(self, "split_ok", False):
+                candidates.append(("triton_split", True, True, supports_gqa))
             if supports_gqa:
-                candidates.append(("enable_gqa", False, True))
-            candidates.append(("repeat_kv", False, False))
+                candidates.append(("enable_gqa", False, False, True))
+            candidates.append(("repeat_kv", False, False, False))
 
             timings = []
-            for name, fused, gqa in candidates:
-                self.fused_attn, self.gqa = fused, gqa
-                timings.append((self._time_decode(), name, fused, gqa))
+            for name, fused, split, gqa in candidates:
+                self.fused_attn, self.split_attn, self.gqa = fused, split, gqa
+                timings.append((self._time_decode(), name, fused, split, gqa))
 
-            best_ms, best_name, self.fused_attn, self.gqa = min(timings)
-            summary = ", ".join(f"{n} {ms:.3f} ms" for ms, n, _, _ in timings)
+            best_ms, best_name, self.fused_attn, self.split_attn, self.gqa = min(timings)
+            summary = ", ".join(f"{n} {ms:.3f} ms" for ms, n, _, _, _ in timings)
             print(f"[engine] decode step: {summary} -> {best_name}", flush=True)
         except Exception as exc:  # noqa: BLE001 - timing must never fail a run
             print(f"[engine] attention timing failed ({exc}); falling back", flush=True)
-            self.fused_attn, self.gqa = False, supports_gqa
+            self.fused_attn, self.split_attn, self.gqa = False, False, supports_gqa
         finally:
             self.g_pos.zero_()
 
@@ -419,16 +423,24 @@ class Engine:
                 )
                 ref = ref.transpose(1, 2).reshape(batch, 1, self.q_size)
 
-                self.fused_attn = bool(
-                    torch.isfinite(got).all()
-                    and torch.allclose(got.float(), ref.float(), atol=2e-2, rtol=2e-2)
+                def matches(candidate):
+                    return bool(
+                        torch.isfinite(candidate).all()
+                        and torch.allclose(candidate.float(), ref.float(), atol=2e-2, rtol=2e-2)
+                    )
+
+                self.fused_attn = matches(got)
+                split_ok = matches(
+                    _k_attn_split(q, ck, cv, probe, self.HEADS, self.KV_HEADS, self.SCALE)
                 )
+                self.split_ok = split_ok
                 if not self.fused_attn:
                     delta = (got.float() - ref.float()).abs().max().item()
                     print(f"[engine] fused attention off, max delta {delta:.3e}", flush=True)
             except Exception as exc:  # noqa: BLE001
                 print(f"[engine] fused attention unavailable ({exc})", flush=True)
                 self.fused_attn = False
+                self.split_ok = False
         print(
             f"[engine] fused kernels: norm={self.fused_norm} rope={self.fused_rope} "
             f"swiglu={self.fused_swiglu} norm_rope={self.fused_norm_rope}",
@@ -484,7 +496,8 @@ class Engine:
             # Writes [batch, 1, heads * head_dim] directly, which is already
             # the layout o_proj wants - the SDPA path needs a transpose and a
             # copy to get there.
-            a = _k_attn(q, ck, cv, position, self.HEADS, self.KV_HEADS, self.SCALE)
+            fn = _k_attn_split if self.split_attn else _k_attn
+            a = fn(q, ck, cv, position, self.HEADS, self.KV_HEADS, self.SCALE)
         else:
             a = self._sdpa(q.transpose(1, 2), keys, values, is_causal=is_causal, attn_mask=mask)
             a = a.transpose(1, 2).reshape(batch, tokens, self.q_size)
