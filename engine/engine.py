@@ -205,6 +205,7 @@ class Engine:
         self.gemm_blocks = None
         self.gemm_choice = {}
         self.prefill_fused = True
+        self.attn_tune = (64, 4)
         self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
@@ -352,26 +353,33 @@ class Engine:
             # Time whole decode steps, not the attention call alone: the fused
             # kernel also removes the mask build and the output transpose, and
             # only an end-to-end step prices that in.
+            # Block width and warp count are tuned rather than assumed: this
+            # kernel streams the cache, so how much of it is in flight matters,
+            # and the right answer differs between one sequence and sixteen.
             candidates = []
-            if self.fused_attn:
-                candidates.append(("triton", True, False, supports_gqa))
-            if getattr(self, "split_ok", False):
-                candidates.append(("triton_split", True, True, supports_gqa))
+            for tune in ((64, 4), (128, 4), (64, 8), (128, 8)):
+                if self.fused_attn:
+                    candidates.append((f"triton{tune}", True, False, supports_gqa, tune))
+                if getattr(self, "split_ok", False):
+                    candidates.append((f"split{tune}", True, True, supports_gqa, tune))
             if supports_gqa:
-                candidates.append(("enable_gqa", False, False, True))
-            candidates.append(("repeat_kv", False, False, False))
+                candidates.append(("enable_gqa", False, False, True, (64, 4)))
+            candidates.append(("repeat_kv", False, False, False, (64, 4)))
 
             timings = []
-            for name, fused, split, gqa in candidates:
+            for name, fused, split, gqa, tune in candidates:
                 self.fused_attn, self.split_attn, self.gqa = fused, split, gqa
-                timings.append((self._time_decode(), name, fused, split, gqa))
+                self.attn_tune = tune
+                timings.append((self._time_decode(), name, fused, split, gqa, tune))
 
-            best_ms, best_name, self.fused_attn, self.split_attn, self.gqa = min(timings)
-            summary = ", ".join(f"{n} {ms:.3f} ms" for ms, n, _, _, _ in timings)
+            (best_ms, best_name, self.fused_attn, self.split_attn,
+             self.gqa, self.attn_tune) = min(timings)
+            summary = ", ".join(f"{n} {ms:.3f}" for ms, n, *_ in timings)
             print(f"[engine] decode step: {summary} -> {best_name}", flush=True)
         except Exception as exc:  # noqa: BLE001 - timing must never fail a run
             print(f"[engine] attention timing failed ({exc}); falling back", flush=True)
             self.fused_attn, self.split_attn, self.gqa = False, False, supports_gqa
+            self.attn_tune = (64, 4)
         finally:
             self.g_pos.zero_()
 
@@ -670,7 +678,8 @@ class Engine:
             # the layout o_proj wants - the SDPA path needs a transpose and a
             # copy to get there.
             fn = _k_attn_split if self.split_attn else _k_attn
-            a = fn(q, ck, cv, position, self.HEADS, self.KV_HEADS, self.SCALE)
+            a = fn(q, ck, cv, position, self.HEADS, self.KV_HEADS, self.SCALE,
+                   *self.attn_tune)
         else:
             keys = ck if position is not None else ck[:, :, :end, :]
             values = cv if position is not None else cv[:, :, :end, :]

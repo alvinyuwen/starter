@@ -667,7 +667,8 @@ def _merge_splits_kernel(
              (acc / total).to(out_ptr.dtype.element_ty), mask=lane_mask)
 
 
-def decode_attention_split(q, cache_k, cache_v, pos, heads, kv_heads, scale, splits=8):
+def decode_attention_split(q, cache_k, cache_v, pos, heads, kv_heads, scale,
+                           block_n=64, num_warps=4, splits=8):
     """Split-K decode attention, for shapes too small to fill the device."""
     batch, _, _, head_dim = q.shape
     capacity = cache_k.shape[2]
@@ -681,7 +682,7 @@ def decode_attention_split(q, cache_k, cache_v, pos, heads, kv_heads, scale, spl
     _split_attn_kernel[(programs,)](
         q, cache_k, cache_v, partial, stats, pos,
         heads, kv_heads, capacity, head_dim, heads // kv_heads, scale, splits,
-        BLOCK_N=64, D_BLOCK=d_block, num_warps=4,
+        BLOCK_N=block_n, D_BLOCK=d_block, num_warps=num_warps,
     )
     _merge_splits_kernel[(batch * heads,)](
         partial, stats, out, head_dim, splits, D_BLOCK=d_block, num_warps=4,
@@ -689,7 +690,8 @@ def decode_attention_split(q, cache_k, cache_v, pos, heads, kv_heads, scale, spl
     return out
 
 
-def decode_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale):
+def decode_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale,
+                     block_n=64, num_warps=4):
     """Attention for one decode token against a fixed-capacity cache.
 
     ``q`` is ``[batch, 1, heads, head_dim]`` contiguous, the caches are
@@ -704,9 +706,9 @@ def decode_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale):
     _decode_attn_kernel[(batch * heads,)](
         q, cache_k, cache_v, out, pos,
         heads, kv_heads, capacity, head_dim, heads // kv_heads, scale,
-        BLOCK_N=64,
+        BLOCK_N=block_n,
         D_BLOCK=triton.next_power_of_2(head_dim),
-        num_warps=4,
+        num_warps=num_warps,
     )
     return out
 
