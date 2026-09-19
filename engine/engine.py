@@ -119,6 +119,16 @@ class Engine:
         self.layers = []
         for idx, layer in enumerate(base.layers):
             attn, mlp = layer.self_attn, layer.mlp
+            # Fuse and release one layer at a time. Building every fused copy
+            # first would hold both layouts for the whole model at once, and
+            # that transient is ~4.7 GB of avoidable peak.
+            qkv = torch.cat(
+                [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
+            ).contiguous()
+            gate_up = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], dim=0).contiguous()
+            attn.q_proj = attn.k_proj = attn.v_proj = None
+            mlp.gate_proj = mlp.up_proj = None
+
             self.layers.append(
                 {
                     "idx": idx,
@@ -126,28 +136,15 @@ class Engine:
                     # One GEMM instead of three. Every output row is still the
                     # same dot product of the same input row against the same
                     # weight row: a reordering, not a reformulation.
-                    "qkv": torch.cat(
-                        [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
-                    ).contiguous(),
+                    "qkv": qkv,
                     "q_norm": attn.q_norm.weight,
                     "k_norm": attn.k_norm.weight,
                     "o": attn.o_proj.weight,
                     "post_ln": layer.post_attention_layernorm.weight,
-                    "gate_up": torch.cat(
-                        [mlp.gate_proj.weight, mlp.up_proj.weight], dim=0
-                    ).contiguous(),
+                    "gate_up": gate_up,
                     "down": mlp.down_proj.weight,
                 }
             )
-
-        # The unfused originals are dead weight once copied; drop them so the
-        # fused copies do not double peak memory.
-        for layer in base.layers:
-            layer.self_attn.q_proj = None
-            layer.self_attn.k_proj = None
-            layer.self_attn.v_proj = None
-            layer.mlp.gate_proj = None
-            layer.mlp.up_proj = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -218,17 +215,61 @@ class Engine:
             q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.SCALE
         )
 
-    def _probe_gqa(self, batch: int) -> None:
-        if self.gqa is not None:
-            return
+    def _supports_gqa(self, batch: int) -> bool:
         q = torch.zeros(batch, self.HEADS, 1, self.HEAD_DIM, dtype=self.dtype, device=DEVICE)
         kv = torch.zeros(batch, self.KV_HEADS, 8, self.HEAD_DIM, dtype=self.dtype, device=DEVICE)
         try:
             F.scaled_dot_product_attention(q, kv, kv, scale=self.SCALE, enable_gqa=True)
-            self.gqa = True
+            return True
         except Exception as exc:  # noqa: BLE001 - any failure means fall back
-            print(f"[engine] enable_gqa unavailable ({exc}); using repeat_kv", flush=True)
+            print(f"[engine] enable_gqa unavailable ({exc})", flush=True)
+            return False
+
+    def _time_decode(self, iters: int = 12) -> float:
+        """Median-ish seconds per eager decode step, for picking between paths."""
+        for _ in range(3):
+            self.g_pos.zero_()
+            self._forward_decode()
+        torch.cuda.synchronize()
+        start, stop = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            self.g_pos.zero_()
+            self._forward_decode()
+        stop.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(stop) / iters
+
+    def _select_attention(self, batch: int) -> None:
+        """Measure the two GQA paths instead of assuming one wins.
+
+        ``enable_gqa`` avoids materialising a 4x copy of the cache, but on some
+        builds it steers SDPA onto the math backend, which is far worse. Warmup
+        is untimed and shape is known, so the engine settles this by timing
+        both rather than by guessing about backend coverage.
+        """
+        if not self.cuda:
             self.gqa = False
+            return
+        if not self._supports_gqa(batch):
+            self.gqa = False
+            return
+        try:
+            self.gqa = True
+            with_gqa = self._time_decode()
+            self.gqa = False
+            without = self._time_decode()
+            self.gqa = with_gqa <= without
+            print(
+                f"[engine] decode step: enable_gqa {with_gqa:.3f} ms vs repeat_kv "
+                f"{without:.3f} ms -> {'enable_gqa' if self.gqa else 'repeat_kv'}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - timing must never fail a run
+            print(f"[engine] attention timing failed ({exc}); enable_gqa", flush=True)
+            self.gqa = True
+        finally:
+            self.g_pos.zero_()
 
     # --------------------------------------------------------------- forward
 
@@ -359,7 +400,6 @@ class Engine:
             torch.cuda.empty_cache()
 
         self._grow_rope(capacity + 1)
-        self._probe_gqa(batch)
 
         shape = (batch, self.KV_HEADS, capacity, self.HEAD_DIM)
         self.cache_k = [
@@ -374,6 +414,10 @@ class Engine:
         self.g_token = torch.zeros(batch, 1, dtype=torch.int64, device=DEVICE)
         self.g_pos = torch.zeros(1, dtype=torch.int64, device=DEVICE)
         self.g_arange = torch.arange(capacity, dtype=torch.int64, device=DEVICE)
+
+        # Both need the buffers above to exist, and both belong to warmup,
+        # which is untimed: settle the attention path, then capture it.
+        self._select_attention(batch)
         self._capture()
 
     def _capture(self) -> None:

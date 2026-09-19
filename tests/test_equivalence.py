@@ -30,9 +30,17 @@ DTYPE = torch.float32
 torch.manual_seed(0)
 
 
-def build_model(tmp, layers=3, hidden=128, heads=4, kv_heads=2, head_dim=32, vocab=256):
-    """A miniature Qwen3 with the real structure: GQA with 2 query heads per
-    KV head, head_dim independent of hidden/heads, tied embeddings."""
+def build_model(tmp, layers=3, hidden=320, heads=8, kv_heads=2, head_dim=128, vocab=256):
+    """A miniature Qwen3 that keeps the parts of the real geometry that the
+    engine is sensitive to.
+
+    head_dim is 128 as in the real checkpoint, because RoPE's frequency table
+    and the per-head norm both depend on it. The group ratio is 4 query heads
+    per KV head, as in the real 32/8, so the GQA mapping is exercised rather
+    than trivially satisfied. hidden is deliberately not heads*head_dim, which
+    is also true of the real model (2560 vs 4096) and is the case a reshape
+    bug would sail through.
+    """
     config = Qwen3Config(
         vocab_size=vocab,
         hidden_size=hidden,
@@ -46,6 +54,10 @@ def build_model(tmp, layers=3, hidden=128, heads=4, kv_heads=2, head_dim=32, voc
         rms_norm_eps=1e-6,
         tie_word_embeddings=True,
         attn_implementation="sdpa",
+        # The real checkpoint has no sliding window; without this the config
+        # default turns one on and the comparison stops being meaningful.
+        use_sliding_window=False,
+        sliding_window=None,
     )
     model = AutoModelForCausalLM.from_config(config)
     model = model.to(DTYPE).eval()
@@ -130,6 +142,61 @@ def run_reset_case(path, vocab):
     return ok
 
 
+def run_logit_delta(path, vocab):
+    """How much of the 2.0-logit tie margin does this engine actually spend?
+
+    Argmax agreement alone can hide an engine sitting just inside the margin on
+    every token. Comparing raw logits says how much headroom is left before a
+    reordering starts flipping genuine near-ties.
+    """
+    reference = AutoModelForCausalLM.from_pretrained(
+        path, torch_dtype=DTYPE, attn_implementation="sdpa", local_files_only=True
+    ).eval()
+    eng = engine_mod.Engine(str(path))
+
+    torch.manual_seed(11)
+    ids = torch.randint(0, vocab, (2, 40)).tolist()
+    tensor = torch.tensor(ids, dtype=torch.int64)
+
+    eng._ensure_shape(2, 40, 4)
+    with torch.inference_mode():
+        mine = eng._forward_prefill(tensor, 40)
+        want = reference(input_ids=tensor, use_cache=True, logits_to_keep=1, return_dict=True).logits
+
+    delta = (mine.float() - want.float()).abs().max().item()
+    scale = want.float().abs().max().item()
+    ok = delta < 0.05 * max(scale, 1.0)
+    print(f"{'PASS' if ok else 'FAIL'}  prefill logit delta {delta:.2e} "
+          f"(logit magnitude ~{scale:.2f}; tie margin is 2.0)")
+    return ok
+
+
+def run_shape_reuse(path, vocab):
+    """Same capacity, different prompt length.
+
+    _ensure_shape keys on (batch, capacity), so this reuses buffers built for a
+    different split of prompt and output. The position bookkeeping has to come
+    from seq_len on each call, not from whatever built the cache.
+    """
+    reference = AutoModelForCausalLM.from_pretrained(
+        path, torch_dtype=DTYPE, attn_implementation="sdpa", local_files_only=True
+    ).eval()
+    eng = engine_mod.Engine(str(path))
+
+    torch.manual_seed(23)
+    first = torch.randint(0, vocab, (2, 30)).tolist()
+    second = torch.randint(0, vocab, (2, 26)).tolist()
+
+    list(eng.generate(first, 6))          # capacity 36
+    want = reference_generate(reference, second, 10)
+    got = list(eng.generate(second, 10))  # capacity 36 again, different split
+
+    ok = want == got
+    print(f"{'PASS' if ok else 'FAIL'}  shape reuse at equal capacity"
+          f"{'' if ok else f' want {want[:2]} got {got[:2]}'}")
+    return ok
+
+
 def main():
     import tempfile
 
@@ -146,7 +213,10 @@ def main():
             # Force multi-chunk prefill: chunk tokens below batch*prompt.
             run_case(path, "chunked prefill (mask path)", 2, 48, 6, vocab, chunk=32),
             run_case(path, "chunked prefill, uneven tail", 3, 50, 4, vocab, chunk=36),
+            run_case(path, "long decode run (drift)", 2, 32, 24, vocab),
             run_reset_case(path, vocab),
+            run_shape_reuse(path, vocab),
+            run_logit_delta(path, vocab),
         ]
 
     print()
