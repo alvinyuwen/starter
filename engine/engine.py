@@ -35,6 +35,16 @@ PREFILL_CHUNK_TOKENS = 16384
 #: code path in fp32, where bf16 kernel coverage is patchy.
 LOAD_DTYPE = torch.bfloat16
 
+# Triton needs a GPU to compile at all, so an import failure here is expected
+# off-target and must not be fatal: the engine simply keeps the eager path.
+_kernels_error = None
+try:
+    from kernels.rmsnorm import rms_norm as _k_rms_norm
+    from kernels.fused import rope as _k_rope, swiglu as _k_swiglu
+except Exception as _exc:  # noqa: BLE001
+    _kernels_error = _exc
+    _k_rms_norm = _k_rope = _k_swiglu = None
+
 
 class _Ready:
     """Stands in for a CUDA event when there is no CUDA to wait on."""
@@ -65,13 +75,18 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(q, k, cos, sin):
-    """``apply_rotary_pos_emb`` with ``unsqueeze_dim=1``.
+    """``apply_rotary_pos_emb`` applied on ``[B, T, H, D]``.
+
+    The reference rotates after the transpose, broadcasting cos/sin over the
+    head axis with ``unsqueeze_dim=1``. Here the head axis is 2 instead, so
+    cos/sin broadcast as ``[1, T, 1, D]``; every (batch, token, head) row still
+    sees exactly the angles for its own token, so the values are unchanged.
 
     cos/sin arrive already in BF16: the reference casts the tables before the
     multiply, so multiplying in FP32 here would be a reformulation.
     """
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
@@ -169,6 +184,9 @@ class Engine:
         self.g_out = None
         self.g_arange = None
         self.gqa = None
+        self.fused_norm = False
+        self.fused_rope = False
+        self.fused_swiglu = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
     # ------------------------------------------------------------------ rope
@@ -271,6 +289,84 @@ class Engine:
         finally:
             self.g_pos.zero_()
 
+    # ---------------------------------------------------------------- fusion
+
+    def _norm(self, x, weight):
+        if self.fused_norm:
+            return _k_rms_norm(x, weight, self.EPS)
+        return rms_norm(x, weight, self.EPS)
+
+    def _rope(self, q, k, cos, sin):
+        if self.fused_rope:
+            return _k_rope(q, cos, sin), _k_rope(k, cos, sin)
+        return apply_rope(q, k, cos, sin)
+
+    def _swiglu(self, fused):
+        if self.fused_swiglu:
+            return _k_swiglu(fused)
+        gate, up = fused.chunk(2, dim=-1)
+        return F.silu(gate) * up
+
+    def _validate_kernels(self, batch: int) -> None:
+        """Adopt each fused kernel only if it reproduces the eager path exactly.
+
+        These kernels cannot be tested off the target GPU - Triton needs one to
+        compile at all - so they are checked here, at warmup, against the
+        reference chain they replace, on tensors of the real shape. Anything
+        that does not match bit for bit is not worth the tie margin, so it is
+        simply not used.
+        """
+        if not self.cuda or _kernels_error is not None:
+            if _kernels_error is not None:
+                print(f"[engine] triton kernels unavailable ({_kernels_error})", flush=True)
+            return
+
+        inner = self.layers[0]["gate_up"].shape[0] // 2
+        weight = self.layers[0]["in_ln"]
+        head_w = self.layers[0]["q_norm"]
+        verdict = {"norm": True, "rope": True, "swiglu": True}
+
+        # Both shapes that reach these kernels: the single-token decode step and
+        # a multi-token prefill chunk. The index arithmetic differs between them
+        # - a kernel can be right for one and wrong for the other.
+        for tokens in (1, 5):
+            hidden = torch.randn(batch, tokens, self.HIDDEN, dtype=self.dtype, device=DEVICE)
+            heads = torch.randn(
+                batch, tokens, self.HEADS, self.HEAD_DIM, dtype=self.dtype, device=DEVICE
+            )
+            gate_up = torch.randn(batch, tokens, 2 * inner, dtype=self.dtype, device=DEVICE)
+            cos = self.cos_table[:tokens]
+            sin = self.sin_table[:tokens]
+
+            checks = (
+                ("norm", lambda: _k_rms_norm(hidden, weight, self.EPS),
+                 lambda: rms_norm(hidden, weight, self.EPS)),
+                ("norm", lambda: _k_rms_norm(heads, head_w, self.EPS),
+                 lambda: rms_norm(heads, head_w, self.EPS)),
+                ("rope", lambda: _k_rope(heads, cos, sin),
+                 lambda: apply_rope(heads, heads, cos, sin)[0]),
+                ("swiglu", lambda: _k_swiglu(gate_up),
+                 lambda: F.silu(gate_up.chunk(2, dim=-1)[0]) * gate_up.chunk(2, dim=-1)[1]),
+            )
+            for name, fused_fn, eager_fn in checks:
+                try:
+                    ok = torch.equal(fused_fn(), eager_fn())
+                except Exception as exc:  # noqa: BLE001 - a broken kernel is just unused
+                    print(f"[engine] kernel {name} t={tokens} failed ({exc})", flush=True)
+                    ok = False
+                if not ok:
+                    print(f"[engine] kernel {name} mismatched eager at t={tokens}", flush=True)
+                verdict[name] &= ok
+
+        self.fused_norm = verdict["norm"]
+        self.fused_rope = verdict["rope"]
+        self.fused_swiglu = verdict["swiglu"]
+        print(
+            f"[engine] fused kernels: norm={self.fused_norm} rope={self.fused_rope} "
+            f"swiglu={self.fused_swiglu}",
+            flush=True,
+        )
+
     # --------------------------------------------------------------- forward
 
     def _block(self, x, layer, cos, sin, *, position, start, mask, is_causal):
@@ -282,20 +378,25 @@ class Engine:
         batch, tokens, _ = x.shape
         residual = x
 
-        n = rms_norm(x, layer["in_ln"], self.EPS)
+        n = self._norm(x, layer["in_ln"])
         q, k, v = F.linear(n, layer["qkv"]).split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
 
-        # Per-head RMSNorm over the 128-wide head dimension, before RoPE and
-        # before the transpose. Qwen3 norms q and k; never v.
-        q = q.view(batch, tokens, self.HEADS, self.HEAD_DIM)
-        k = k.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM)
-        q = rms_norm(q, layer["q_norm"], self.EPS).transpose(1, 2)
-        k = rms_norm(k, layer["k_norm"], self.EPS).transpose(1, 2)
-        v = v.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM).transpose(1, 2)
+        # Per-head RMSNorm over the 128-wide head dimension, before RoPE.
+        # Qwen3 norms q and k; never v.
+        q = self._norm(q.view(batch, tokens, self.HEADS, self.HEAD_DIM), layer["q_norm"])
+        k = self._norm(k.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM), layer["k_norm"])
 
-        q, k = apply_rope(q, k, cos, sin)
+        # RoPE runs here, on [B, T, H, D], rather than after the transpose as
+        # the reference writes it. It is elementwise per (batch, token, head)
+        # row and indexed only by token, so the result is identical - but the
+        # tensor is still contiguous, which is what lets a fused kernel read it
+        # with a single stride instead of a transposed one.
+        q, k = self._rope(q, k, cos, sin)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM).transpose(1, 2)
 
         ck, cv = self.cache_k[layer["idx"]], self.cache_v[layer["idx"]]
         if position is None:
@@ -315,9 +416,8 @@ class Engine:
         x = residual + F.linear(a, layer["o"])
 
         residual = x
-        m = rms_norm(x, layer["post_ln"], self.EPS)
-        gate, up = F.linear(m, layer["gate_up"]).chunk(2, dim=-1)
-        return residual + F.linear(F.silu(gate) * up, layer["down"])
+        m = self._norm(x, layer["post_ln"])
+        return residual + F.linear(self._swiglu(F.linear(m, layer["gate_up"])), layer["down"])
 
     def _forward_prefill(self, ids, seq_len):
         """Consume the prompt and return logits for its last position only."""
@@ -332,8 +432,8 @@ class Engine:
             stop = min(start + chunk, seq_len)
             width = stop - start
             x = x_all[:, start:stop, :]
-            cos = self.cos_table[start:stop].unsqueeze(0)
-            sin = self.sin_table[start:stop].unsqueeze(0)
+            cos = self.cos_table[start:stop]
+            sin = self.sin_table[start:stop]
 
             if start == 0 and stop == seq_len:
                 # Whole prompt at once: let SDPA use its causal fast path.
@@ -354,7 +454,7 @@ class Engine:
                 )
             hidden = x
 
-        x = rms_norm(hidden[:, -1:, :], self.final_norm_w, self.EPS)
+        x = self._norm(hidden[:, -1:, :].contiguous(), self.final_norm_w)
         return F.linear(x, self.lm_head_w)
 
     def _forward_decode(self):
@@ -365,8 +465,8 @@ class Engine:
         """
         pos = self.g_pos
         x = F.embedding(self.g_token, self.embed)
-        cos = self.cos_table.index_select(0, pos).unsqueeze(0)
-        sin = self.sin_table.index_select(0, pos).unsqueeze(0)
+        cos = self.cos_table.index_select(0, pos)
+        sin = self.sin_table.index_select(0, pos)
 
         # Slots at index <= pos hold real keys; the rest is capacity that was
         # never written. NEG underflows to zero through the softmax.
@@ -377,7 +477,7 @@ class Engine:
             x = self._block(
                 x, layer, cos, sin, position=pos, start=0, mask=mask, is_causal=False
             )
-        x = rms_norm(x, self.final_norm_w, self.EPS)
+        x = self._norm(x, self.final_norm_w)
         token = F.linear(x, self.lm_head_w)[:, -1, :].argmax(dim=-1, keepdim=True)
 
         # Close the loop inside the captured region: next replay reads this
@@ -417,6 +517,7 @@ class Engine:
 
         # Both need the buffers above to exist, and both belong to warmup,
         # which is untimed: settle the attention path, then capture it.
+        self._validate_kernels(batch)
         self._select_attention(batch)
         self._capture()
 
