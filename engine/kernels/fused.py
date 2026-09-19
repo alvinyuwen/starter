@@ -343,9 +343,13 @@ def _skinny_kernel(
             x_ptr + offs_m[:, None] * K + offs_k[None, :],
             mask=m_mask[:, None] & k_mask[None, :], other=0.0,
         )
+        # Weights are read once per step and never revisited, so tell the
+        # cache not to keep them. Holding 8 GB of single-use weights in L2
+        # only evicts the activations that do get reused.
         w_tile = tl.load(
             w_ptr + offs_n[:, None] * K + offs_k[None, :],
             mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+            eviction_policy="evict_first",
         )
         # Accumulate in FP32, as cuBLAS does for BF16 inputs. The order of the
         # sum differs from cuBLAS's, which is a reordering and within budget.
@@ -358,8 +362,14 @@ def _skinny_kernel(
     )
 
 
-def skinny_linear(x, weight, block_n=64, block_k=64):
-    """F.linear for a small number of rows, tuned for weight bandwidth."""
+def skinny_linear(x, weight, block_n=64, block_k=64, num_warps=4, num_stages=4):
+    """F.linear for a small number of rows, tuned for weight bandwidth.
+
+    Warp count and pipeline depth matter as much as the tile here: the kernel
+    is waiting on memory, so the useful knob is how many loads can be in
+    flight, not how much arithmetic a program does. Both are left to the
+    caller because the right answer differs per weight shape.
+    """
     *lead, k = x.shape
     rows = 1
     for d in lead:
@@ -376,7 +386,7 @@ def skinny_linear(x, weight, block_n=64, block_k=64):
     _skinny_kernel[(triton.cdiv(n, block_n),)](
         x2, weight, out, rows, n, k,
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-        num_warps=4, num_stages=4,
+        num_warps=num_warps, num_stages=num_stages,
     )
     return out.reshape(*lead, n)
 

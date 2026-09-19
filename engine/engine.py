@@ -830,7 +830,10 @@ class Engine:
             probe = torch.randn(self.batch, 1, self.HIDDEN, dtype=self.dtype, device=DEVICE)
             reference = F.linear(probe, self.layers[0]["qkv"])
             usable = []
-            for blocks in ((64, 64), (128, 64), (64, 128), (128, 128)):
+            grid = [(bn, bk, w, st)
+                    for bn in (64, 128) for bk in (64, 128)
+                    for w in (4, 8) for st in (3,)]
+            for blocks in grid:
                 try:
                     got = _k_skinny(probe, self.layers[0]["qkv"], *blocks)
                 except Exception:  # noqa: BLE001 - a tiling that will not compile
