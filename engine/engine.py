@@ -928,10 +928,16 @@ class Engine:
         # "native" reads a pre-transposed [K, N] copy and feeds tl.dot directly.
         # "plain" holds [N, K] and transposes each tile inside the MMA, which
         # costs the shared memory that pipeline stages need.
+        # A tile costs block_n * block_k * 2 bytes per stage in shared memory,
+        # and an SM has about 228 KB. Combinations past that will not compile,
+        # so filtering them here saves the compile attempt rather than catching
+        # the failure afterwards.
         grid = []
-        for block_n in (64, 128):
+        for block_n in (64, 128, 256):
             for block_k in (64, 128, 256):
-                for stages in (3, 4):
+                for stages in (3, 4, 5):
+                    if (block_n + 16) * block_k * 2 * stages > 190_000:
+                        continue
                     grid.append(("native", block_n, block_k, 8, stages, 1))
                     grid.append(("plain", block_n, block_k, 8, stages, 1))
                     grid.append(("plain", block_n, block_k, 8, stages, 8))
