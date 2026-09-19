@@ -52,6 +52,7 @@ try:
         kv_to_cache as _k_kv_cache,
         skinny_linear as _k_skinny,
         skinny_linear_split as _k_skinny_split,
+        skinny_linear_t as _k_skinny_t,
         rope as _k_rope,
         swiglu as _k_swiglu,
         decode_attention as _k_attn,
@@ -60,7 +61,7 @@ try:
     )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = _k_kv_cache = _k_skinny = _k_skinny_split = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = _k_kv_cache = _k_skinny = _k_skinny_split = _k_skinny_t = None
 
 
 class _Ready:
@@ -178,6 +179,22 @@ class Engine:
                     "down": mlp.down_proj.weight,
                 }
             )
+        # A [K, N] copy of every weight decode multiplies against. It doubles
+        # the weight footprint - 8 GB on top of 8, against a 72 GB gate and a
+        # measured peak near 20 - and buys a matmul that feeds tl.dot without
+        # rearranging a tile in shared memory. Whether that wins is measured
+        # per shape; cuBLAS keeps the original layout either way.
+        self.transposed = {}
+        try:
+            for layer in self.layers:
+                for name in ("qkv", "o", "gate_up", "down"):
+                    weight = layer[name]
+                    self.transposed[weight.data_ptr()] = weight.t().contiguous()
+            self.transposed[self.lm_head_w.data_ptr()] = self.lm_head_w.t().contiguous()
+        except torch.cuda.OutOfMemoryError:
+            print("[engine] no room for transposed weights; [N, K] only", flush=True)
+            self.transposed = {}
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -415,12 +432,16 @@ class Engine:
         where the cost is purely streaming the weights.
         """
         if x.shape[0] * x.shape[1] <= 32:
-            blocks = self.gemm_choice.get((weight.shape[0], weight.shape[1]))
-            if blocks is not None:
-                *tile, splits = blocks
+            choice = self.gemm_choice.get((weight.shape[0], weight.shape[1]))
+            if choice is not None:
+                kind, bn, bk, warps, stages, splits = choice
+                if kind == "native":
+                    return _k_skinny_t(
+                        x, self.transposed[weight.data_ptr()], bn, bk, warps, stages
+                    )
                 if splits > 1:
-                    return _k_skinny_split(x, weight, *tile, splits)
-                return _k_skinny(x, weight, *tile)
+                    return _k_skinny_split(x, weight, bn, bk, warps, stages, splits)
+                return _k_skinny(x, weight, bn, bk, warps, stages)
         return F.linear(x, weight)
 
     def _add_norm(self, residual, delta, weight):
@@ -846,103 +867,107 @@ class Engine:
         self._select_prefill(batch, seq_len)
         self._capture()
 
+    def _time_op(self, fn, reps: int = 40) -> float:
+        """Milliseconds per call, with launch overhead hidden behind the work.
+
+        The CPU runs ahead of the device, so with enough repetitions the
+        launches overlap the kernels and what is left is device time. That
+        matters because the smallest of these matmuls runs in tens of
+        microseconds, where a per-launch cost would dominate the comparison.
+        """
+        for _ in range(3):
+            fn()
+        torch.cuda.synchronize()
+        start, stop = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(reps):
+            fn()
+        stop.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(stop) / reps
+
     def _select_gemm(self) -> None:
-        """Decide, per weight shape, whether the skinny matmul beats cuBLAS.
+        """Pick a matmul per weight shape by timing that matmul directly.
 
-        Decode is weight-bandwidth bound, so this is where the remaining time
-        is. Measurement rather than assumption, for two reasons: whether a
-        hand-tiled kernel beats a tuned library at these shapes is not knowable
-        from a machine with no GPU, and the answer is not even the same across
-        shapes - at batch 1 it won by 30%, at batch 16 it lost by 18%.
+        Decode reads 8 GB of weights per step at a measured 1.2 to 1.7 TB/s
+        against a device that does about 3.35, so this is the whole remaining
+        gap. What limits it is bytes in flight - roughly
+        BLOCK_N * BLOCK_K * 2 * stages per block, times the number of blocks.
+        A 2560-wide weight gives 40 blocks on 132 SMs, and a 64-deep K tile
+        leaves each of those with 24 KB outstanding, well under what saturates
+        HBM. Hence a search over tile width, K depth, pipeline stages, and
+        splitting K.
 
-        Two passes. First pick a tiling using every weight at once, then take
-        that tiling and test each weight shape on its own, keeping the kernel
-        only where it actually helps. Greedy, but it costs a handful of
-        captures rather than the full cross product.
+        Timing each matmul on its own rather than a whole decode step keeps it
+        affordable: the step runs 360 kernels, most irrelevant to this choice.
+        Triton compiles one binary per constexpr combination rather than per
+        weight, so a wide grid costs far less than it appears to.
         """
         self.gemm_choice = {}
         if not self.cuda or _k_skinny is None:
             return
 
-        shapes = []
+        shapes = {}
         for weight in (self.layers[0]["qkv"], self.layers[0]["o"],
                        self.layers[0]["gate_up"], self.layers[0]["down"],
                        self.lm_head_w):
-            key = (weight.shape[0], weight.shape[1])
-            if key not in [s for s, _ in shapes]:
-                shapes.append((key, weight))
+            shapes[(weight.shape[0], weight.shape[1])] = weight
 
-        try:
-            # Accuracy gate. A matmul sums thousands of terms, so its order
-            # differs from cuBLAS's and equality is the wrong test - this is
-            # the reordering budget the contract allows, not an approximation.
-            probe = torch.randn(self.batch, 1, self.HIDDEN, dtype=self.dtype, device=DEVICE)
-            reference = F.linear(probe, self.layers[0]["qkv"])
-            usable = []
-            # splits > 1 spreads a narrow output over more programs; splits
-            # of 1 is the single-pass kernel. Kept small so the whole search,
-            # including Triton compiling each variant, fits the load budget.
-            # BLOCK_K sets how many contiguous bytes each row of the weight
-            # tile reads, which is the coalescing knob for a kernel that is
-            # waiting on memory; it belongs in the search.
-            grid = [(bn, bk, 8, 3, sp)
-                    for bn in (64, 128) for bk in (64, 128) for sp in (1, 8)]
-            for blocks in grid:
+        # "native" reads a pre-transposed [K, N] copy and feeds tl.dot directly.
+        # "plain" holds [N, K] and transposes each tile inside the MMA, which
+        # costs the shared memory that pipeline stages need.
+        grid = []
+        for block_n in (64, 128):
+            for block_k in (64, 128, 256):
+                for stages in (3, 4):
+                    grid.append(("native", block_n, block_k, 8, stages, 1))
+                    grid.append(("plain", block_n, block_k, 8, stages, 1))
+                    grid.append(("plain", block_n, block_k, 8, stages, 8))
+
+        for (n, k), weight in shapes.items():
+            if time.monotonic() - self.started > TUNE_BUDGET_S:
+                print("[engine] tuning budget spent; cublas for the rest", flush=True)
+                break
+
+            x = torch.randn(self.batch, 1, k, dtype=self.dtype, device=DEVICE)
+            weight_t = self.transposed.get(weight.data_ptr())
+            reference = F.linear(x, weight)
+            best_ms = self._time_op(lambda: F.linear(x, weight))
+            baseline_ms, best = best_ms, None
+
+            for variant in grid:
                 if time.monotonic() - self.started > TUNE_BUDGET_S:
-                    print("[engine] tuning budget spent; keeping best so far", flush=True)
                     break
-                try:
-                    *tile, splits = blocks
-                    got = (_k_skinny_split(probe, self.layers[0]["qkv"], *tile, splits)
-                           if splits > 1
-                           else _k_skinny(probe, self.layers[0]["qkv"], *tile))
-                except Exception:  # noqa: BLE001 - a variant that will not compile
+                kind, bn, bk, warps, stages, splits = variant
+                if kind == "native" and weight_t is None:
                     continue
-                if torch.isfinite(got).all() and torch.allclose(
-                    got.float(), reference.float(), atol=2e-2, rtol=2e-2
-                ):
-                    usable.append(blocks)
-            if not usable:
-                print("[engine] skinny matmul rejected on accuracy", flush=True)
-                return
-
-            baseline = self._time_decode()
-            best_ms, best_blocks = baseline, None
-            for blocks in usable:
-                self.gemm_choice = {key: blocks for key, _ in shapes}
-                elapsed = self._time_decode()
+                try:
+                    if kind == "native":
+                        call = (lambda w=weight_t, a=bn, b=bk, c=warps, d=stages:
+                                _k_skinny_t(x, w, a, b, c, d))
+                    elif splits > 1:
+                        call = (lambda a=bn, b=bk, c=warps, d=stages, e=splits:
+                                _k_skinny_split(x, weight, a, b, c, d, e))
+                    else:
+                        call = (lambda a=bn, b=bk, c=warps, d=stages:
+                                _k_skinny(x, weight, a, b, c, d))
+                    got = call()
+                except Exception:  # noqa: BLE001 - shared memory rejects some tilings
+                    continue
+                # A matmul sums thousands of terms, so its order differs from
+                # cuBLAS's. That is the reordering budget, not an approximation.
+                if not (torch.isfinite(got).all() and torch.allclose(
+                        got.float(), reference.float(), atol=2e-2, rtol=2e-2)):
+                    continue
+                elapsed = self._time_op(call)
                 if elapsed < best_ms:
-                    best_ms, best_blocks = elapsed, blocks
+                    best_ms, best = elapsed, variant
 
-            if best_blocks is None:
-                self.gemm_choice = {}
-                print(f"[engine] decode matmul: cublas ({baseline:.3f} ms)", flush=True)
-                return
-
-            # Now drop it from any shape it does not earn its place on.
-            self.gemm_choice = {key: best_blocks for key, _ in shapes}
-            current = best_ms
-            for key, _ in shapes:
-                if time.monotonic() - self.started > TUNE_BUDGET_S:
-                    break
-                self.gemm_choice.pop(key)
-                without = self._time_decode()
-                if without < current:
-                    current = without
-                else:
-                    self.gemm_choice[key] = best_blocks
-
-            kept = [f"{k[0]}x{k[1]}" for k in self.gemm_choice]
-            print(
-                f"[engine] decode matmul: cublas {baseline:.3f} ms -> {current:.3f} ms "
-                f"with {best_blocks} on {kept or 'nothing'}",
-                flush=True,
-            )
-        except Exception as exc:  # noqa: BLE001 - never let tuning fail a run
-            print(f"[engine] matmul tuning failed ({exc}); cublas", flush=True)
-            self.gemm_choice = {}
-        finally:
-            self.g_pos.zero_()
+            if best is not None:
+                self.gemm_choice[(n, k)] = best
+            rate = (n * k * 2) / (best_ms * 1e9)
+            print(f"[engine] matmul {n}x{k}: {best or 'cublas'} {best_ms:.3f} ms "
+                  f"({rate:.2f} TB/s, cublas {baseline_ms:.3f})", flush=True)
 
     def _select_prefill(self, batch: int, seq_len: int) -> None:
         """Measure whether the fused kernels help or hurt the prompt pass.

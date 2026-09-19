@@ -392,6 +392,74 @@ def skinny_linear(x, weight, block_n=64, block_k=64, num_warps=4, num_stages=4):
 
 
 @triton.jit
+def _skinny_t_kernel(
+    x_ptr, wt_ptr, out_ptr, M, N, K,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """out[m, n] = sum_k x[m, k] * wt[k, n], against a pre-transposed weight.
+
+    The other kernel holds the weight as [N, K] and writes tl.dot(x,
+    tl.trans(w)). Hopper's MMA wants its operands in a particular layout, so
+    that transpose becomes a shared-memory shuffle - and shared memory is the
+    same budget that decides how many pipeline stages fit, which is what sets
+    how many bytes are in flight. Since bytes in flight is the binding
+    constraint here, paying shared memory to rearrange a tile is the wrong
+    trade.
+
+    Holding the weight as [K, N] makes this a plain tl.dot with no rearranging,
+    and a [BLOCK_K, BLOCK_N] tile is still BLOCK_K contiguous runs.
+    """
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    n_mask = offs_n < N
+    m_mask = offs_m < M
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+
+        x_tile = tl.load(
+            x_ptr + offs_m[:, None] * K + offs_k[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )
+        wt_tile = tl.load(
+            wt_ptr + offs_k[:, None] * N + offs_n[None, :],
+            mask=k_mask[:, None] & n_mask[None, :], other=0.0,
+            eviction_policy="evict_first",
+        )
+        acc += tl.dot(x_tile, wt_tile, out_dtype=tl.float32)
+
+    tl.store(
+        out_ptr + offs_m[:, None] * N + offs_n[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def skinny_linear_t(x, weight_t, block_n=64, block_k=128, num_warps=8, num_stages=3):
+    """F.linear against a [K, N] weight, for a small number of rows."""
+    *lead, k = x.shape
+    rows = 1
+    for d in lead:
+        rows *= d
+    n = weight_t.shape[1]
+    x2 = x.reshape(rows, k)
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+
+    out = torch.empty(rows, n, dtype=x.dtype, device=x.device)
+    _skinny_t_kernel[(triton.cdiv(n, block_n),)](
+        x2, weight_t, out, rows, n, k,
+        BLOCK_M=max(16, triton.next_power_of_2(rows)),
+        BLOCK_N=block_n, BLOCK_K=block_k,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out.reshape(*lead, n)
+
+
+@triton.jit
 def _skinny_split_kernel(
     x_ptr, w_ptr, part_ptr, M, N, K, splits,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
