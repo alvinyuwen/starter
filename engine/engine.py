@@ -203,6 +203,7 @@ class Engine:
         self.fused_kv_cache = False
         self.gemm_blocks = None
         self.gemm_choice = {}
+        self.prefill_fused = True
         self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
@@ -684,6 +685,29 @@ class Engine:
         if batch * seq_len > PREFILL_CHUNK_TOKENS:
             chunk = max(1, PREFILL_CHUNK_TOKENS // batch)
 
+        # These kernels were written for the one-row decode step. Prefill runs
+        # thousands of rows at once, where PyTorch's vectorised elementwise
+        # kernels may well win, so whether to use them here is a separate
+        # question from whether to use them in decode - and it is measured.
+        saved = (self.fused_norm, self.fused_rope, self.fused_swiglu,
+                 self.fused_norm_rope, self.fused_add_norm, self.fused_kv_cache)
+        if not self.prefill_fused:
+            (self.fused_norm, self.fused_rope, self.fused_swiglu,
+             self.fused_norm_rope, self.fused_add_norm,
+             self.fused_kv_cache) = (False,) * 6
+        try:
+            return self._prefill_body(ids, seq_len)
+        finally:
+            (self.fused_norm, self.fused_rope, self.fused_swiglu,
+             self.fused_norm_rope, self.fused_add_norm,
+             self.fused_kv_cache) = saved
+
+    def _prefill_body(self, ids, seq_len):
+        batch = ids.shape[0]
+        chunk = seq_len
+        if batch * seq_len > PREFILL_CHUNK_TOKENS:
+            chunk = max(1, PREFILL_CHUNK_TOKENS // batch)
+
         x_all = F.embedding(ids, self.embed)
         hidden = None
         for start in range(0, seq_len, chunk):
@@ -795,6 +819,7 @@ class Engine:
         self._validate_kernels(batch)
         self._select_attention(batch)
         self._select_gemm()
+        self._select_prefill(batch, seq_len)
         self._capture()
 
     def _select_gemm(self) -> None:
@@ -881,6 +906,45 @@ class Engine:
             self.gemm_choice = {}
         finally:
             self.g_pos.zero_()
+
+    def _select_prefill(self, batch: int, seq_len: int) -> None:
+        """Measure whether the fused kernels help or hurt the prompt pass.
+
+        At batch 4 with a 2048-token prompt, prefill is over a third of the
+        workload's time, so this is worth settling rather than assuming. The
+        kernels were tuned for a single row; thousands of rows is a different
+        regime and PyTorch's own kernels may be better at it.
+        """
+        if not self.cuda:
+            return
+        try:
+            ids = torch.zeros(batch, seq_len, dtype=torch.int64, device=DEVICE)
+
+            def timed(iters=3):
+                for _ in range(1):
+                    self._forward_prefill(ids, seq_len)
+                torch.cuda.synchronize()
+                start, stop = torch.cuda.Event(True), torch.cuda.Event(True)
+                start.record()
+                for _ in range(iters):
+                    self._forward_prefill(ids, seq_len)
+                stop.record()
+                torch.cuda.synchronize()
+                return start.elapsed_time(stop) / iters
+
+            self.prefill_fused = True
+            with_fused = timed()
+            self.prefill_fused = False
+            without = timed()
+            self.prefill_fused = with_fused <= without
+            print(
+                f"[engine] prefill: fused {with_fused:.1f} ms vs eager {without:.1f} ms "
+                f"-> {'fused' if self.prefill_fused else 'eager'}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - tuning must never fail a run
+            print(f"[engine] prefill tuning failed ({exc}); fused", flush=True)
+            self.prefill_fused = True
 
     def _capture(self) -> None:
         """Capture the decode step.
