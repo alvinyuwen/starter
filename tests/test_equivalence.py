@@ -24,6 +24,7 @@ import engine as engine_mod  # noqa: E402
 
 # No CUDA on this machine; the engine reads its device from the module.
 engine_mod.DEVICE = "cpu"
+engine_mod.LOAD_DTYPE = torch.float32
 
 DTYPE = torch.float32
 torch.manual_seed(0)
