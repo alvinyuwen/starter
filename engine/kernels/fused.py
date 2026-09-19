@@ -113,6 +113,52 @@ def _swiglu_kernel(x_ptr, out_ptr, inner, n_elements, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _add_norm_kernel(
+    res_ptr, delta_ptr, sum_ptr, out_ptr, w_ptr, n_cols, eps, BLOCK: tl.constexpr,
+):
+    """residual + delta, then RMSNorm of the sum, emitting both.
+
+    Every residual join is immediately followed by a norm, and the sum is
+    needed twice - once as the next residual, once as the norm's input - so
+    computing it in the norm's own pass removes a launch and a round trip at
+    each of the two joins per layer.
+
+    The add happens in the working dtype, matching the eager tensor add, and
+    the norm keeps the reference's cast placement.
+    """
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    offsets = row * n_cols + cols
+    out_dtype = out_ptr.dtype.element_ty
+
+    residual = tl.load(res_ptr + offsets, mask=mask, other=0.0)
+    delta = tl.load(delta_ptr + offsets, mask=mask, other=0.0)
+    total = (residual.to(tl.float32) + delta.to(tl.float32)).to(out_dtype)
+    tl.store(sum_ptr + offsets, total, mask=mask)
+
+    xf = total.to(tl.float32)
+    variance = tl.sum(xf * xf, axis=0) / n_cols
+    normed = (xf * tl.math.rsqrt(variance + eps)).to(out_dtype)
+    weight = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, normed * weight, mask=mask)
+
+
+def add_norm(residual, delta, weight, eps):
+    """Returns ``(residual + delta, rms_norm(residual + delta, weight))``."""
+    n_cols = residual.shape[-1]
+    rows = residual.numel() // n_cols
+    total = torch.empty_like(residual)
+    out = torch.empty_like(residual)
+    _add_norm_kernel[(rows,)](
+        residual, delta, total, out, weight, n_cols, eps,
+        BLOCK=triton.next_power_of_2(n_cols),
+        num_warps=8,
+    )
+    return total, out
+
+
+@triton.jit
 def _norm_rope_kernel(
     x_ptr, out_ptr, w_ptr, cos_ptr, sin_ptr,
     tokens, heads, head_dim, half, eps,

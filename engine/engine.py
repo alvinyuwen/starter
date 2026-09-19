@@ -41,6 +41,7 @@ _kernels_error = None
 try:
     from kernels.rmsnorm import rms_norm as _k_rms_norm
     from kernels.fused import (
+        add_norm as _k_add_norm,
         rope as _k_rope,
         swiglu as _k_swiglu,
         decode_attention as _k_attn,
@@ -49,7 +50,7 @@ try:
     )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = None
 
 
 class _Ready:
@@ -196,6 +197,7 @@ class Engine:
         self.fused_swiglu = False
         self.fused_attn = False
         self.split_attn = False
+        self.fused_add_norm = False
         self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
@@ -328,6 +330,12 @@ class Engine:
             return _k_rope(q, cos, sin), _k_rope(k, cos, sin)
         return apply_rope(q, k, cos, sin)
 
+    def _add_norm(self, residual, delta, weight):
+        if self.fused_add_norm:
+            return _k_add_norm(residual, delta, weight, self.EPS)
+        total = residual + delta
+        return total, self._norm(total, weight)
+
     def _norm_rope_pair(self, q, k, qw, kw, cos, sin):
         if self.fused_norm_rope:
             return (_k_norm_rope(q, qw, cos, sin, self.EPS),
@@ -357,7 +365,8 @@ class Engine:
         inner = self.layers[0]["gate_up"].shape[0] // 2
         weight = self.layers[0]["in_ln"]
         head_w = self.layers[0]["q_norm"]
-        verdict = {"norm": True, "rope": True, "swiglu": True, "norm_rope": True}
+        verdict = {"norm": True, "rope": True, "swiglu": True, "norm_rope": True,
+                   "add_norm": True, "add_norm_sum": True}
 
         # Both shapes that reach these kernels: the single-token decode step and
         # a multi-token prefill chunk. The index arithmetic differs between them
@@ -368,6 +377,7 @@ class Engine:
                 batch, tokens, self.HEADS, self.HEAD_DIM, dtype=self.dtype, device=DEVICE
             )
             gate_up = torch.randn(batch, tokens, 2 * inner, dtype=self.dtype, device=DEVICE)
+            hidden2 = torch.randn(batch, tokens, self.HIDDEN, dtype=self.dtype, device=DEVICE)
             cos = self.cos_table[:tokens]
             sin = self.sin_table[:tokens]
 
@@ -380,6 +390,10 @@ class Engine:
                  lambda: apply_rope(heads, heads, cos, sin)[0]),
                 ("swiglu", lambda: _k_swiglu(gate_up),
                  lambda: F.silu(gate_up.chunk(2, dim=-1)[0]) * gate_up.chunk(2, dim=-1)[1]),
+                ("add_norm", lambda: _k_add_norm(hidden, hidden2, weight, self.EPS)[1],
+                 lambda: rms_norm(hidden + hidden2, weight, self.EPS)),
+                ("add_norm_sum", lambda: _k_add_norm(hidden, hidden2, weight, self.EPS)[0],
+                 lambda: hidden + hidden2),
                 ("norm_rope", lambda: _k_norm_rope(heads, head_w, cos, sin, self.EPS),
                  lambda: apply_rope(rms_norm(heads, head_w, self.EPS),
                                     rms_norm(heads, head_w, self.EPS), cos, sin)[0]),
@@ -399,6 +413,8 @@ class Engine:
         self.fused_swiglu = verdict["swiglu"]
         # Only worth taking if both halves it replaces are themselves sound.
         self.fused_norm_rope = verdict["norm_rope"]
+        # Both outputs must be right: the sum feeds the next residual.
+        self.fused_add_norm = verdict["add_norm"] and verdict["add_norm_sum"]
 
         # Attention is a reduction over keys, so a flash-style streaming order
         # will not reproduce SDPA bit for bit the way the elementwise kernels
@@ -443,22 +459,26 @@ class Engine:
                 self.split_ok = False
         print(
             f"[engine] fused kernels: norm={self.fused_norm} rope={self.fused_rope} "
-            f"swiglu={self.fused_swiglu} norm_rope={self.fused_norm_rope}",
+            f"swiglu={self.fused_swiglu} norm_rope={self.fused_norm_rope} "
+            f"add_norm={self.fused_add_norm}",
             flush=True,
         )
 
     # --------------------------------------------------------------- forward
 
-    def _block(self, x, layer, cos, sin, *, position, start, mask, is_causal):
-        """One decoder layer.
+    def _block(self, residual, n, layer, next_norm_w, cos, sin, *,
+               position, start, mask, is_causal):
+        """One decoder layer, taking and returning (residual, pre-normed).
+
+        The input arrives already normalised because the previous layer's
+        closing add produced it: every residual join is followed immediately by
+        a norm, so the two are done together and the next layer's input falls
+        out of this layer's last kernel.
 
         ``position`` is a device index tensor for decode, or ``None`` for
         prefill, where ``start`` gives the absolute offset of this chunk.
         """
-        batch, tokens, _ = x.shape
-        residual = x
-
-        n = self._norm(x, layer["in_ln"])
+        batch, tokens, _ = n.shape
         q, k, v = F.linear(n, layer["qkv"]).split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
@@ -501,11 +521,9 @@ class Engine:
         else:
             a = self._sdpa(q.transpose(1, 2), keys, values, is_causal=is_causal, attn_mask=mask)
             a = a.transpose(1, 2).reshape(batch, tokens, self.q_size)
-        x = residual + F.linear(a, layer["o"])
-
-        residual = x
-        m = self._norm(x, layer["post_ln"])
-        return residual + F.linear(self._swiglu(F.linear(m, layer["gate_up"])), layer["down"])
+        residual, m = self._add_norm(residual, F.linear(a, layer["o"]), layer["post_ln"])
+        mlp = F.linear(self._swiglu(F.linear(m, layer["gate_up"])), layer["down"])
+        return self._add_norm(residual, mlp, next_norm_w)
 
     def _forward_prefill(self, ids, seq_len):
         """Consume the prompt and return logits for its last position only."""
@@ -535,15 +553,20 @@ class Engine:
                 mask = mask.view(1, 1, width, stop)
                 is_causal = False
 
-            for layer in self.layers:
-                x = self._block(
-                    x, layer, cos, sin, position=None, start=start,
+            residual = x
+            n = self._norm(x, self.layers[0]["in_ln"])
+            for i, layer in enumerate(self.layers):
+                nxt = (self.layers[i + 1]["in_ln"] if i + 1 < self.LAYERS
+                       else self.final_norm_w)
+                residual, n = self._block(
+                    residual, n, layer, nxt, cos, sin, position=None, start=start,
                     mask=mask, is_causal=is_causal,
                 )
-            hidden = x
+            hidden = n
 
-        x = self._norm(hidden[:, -1:, :].contiguous(), self.final_norm_w)
-        return F.linear(x, self.lm_head_w)
+        # `n` already carries the final norm: the last layer's closing add was
+        # told to normalise with final_norm_w instead of a next layer's weight.
+        return F.linear(hidden[:, -1:, :], self.lm_head_w)
 
     def _forward_decode(self):
         """One decode step from persistent buffers, and self-feeding.
@@ -564,11 +587,15 @@ class Engine:
             mask = torch.where(self.g_arange <= pos, 0.0, NEG).to(self.dtype)
             mask = mask.view(1, 1, 1, self.capacity)
 
-        for layer in self.layers:
-            x = self._block(
-                x, layer, cos, sin, position=pos, start=0, mask=mask, is_causal=False
+        residual = x
+        n = self._norm(x, self.layers[0]["in_ln"])
+        for i, layer in enumerate(self.layers):
+            nxt = self.layers[i + 1]["in_ln"] if i + 1 < self.LAYERS else self.final_norm_w
+            residual, n = self._block(
+                residual, n, layer, nxt, cos, sin,
+                position=pos, start=0, mask=mask, is_causal=False,
             )
-        x = self._norm(x, self.final_norm_w)
+        x = n
         token = F.linear(x, self.lm_head_w)[:, -1, :].argmax(dim=-1, keepdim=True)
 
         # Close the loop inside the captured region: next replay reads this
