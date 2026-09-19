@@ -16,6 +16,8 @@ reordered; the formula and the cast boundaries may not. Every place that was
 tempting to "improve" carries a comment saying why it is written as it is.
 """
 
+import time
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
@@ -30,6 +32,11 @@ NEG = torch.finfo(torch.bfloat16).min
 #: Single-chunk prefill above this many tokens (batch * prompt) would allocate
 #: a very large MLP activation; beyond it, prefill is chunked instead.
 PREFILL_CHUNK_TOKENS = 16384
+
+#: Load plus one warmup share a 300-second budget, and every tuning variant
+#: costs a Triton compile. Stop exploring at this point and use the best found
+#: so far: a slightly worse configuration beats a run that never starts.
+TUNE_BUDGET_S = 180.0
 
 #: The checkpoint's dtype. Named so a CPU equivalence test can load the same
 #: code path in fp32, where bf16 kernel coverage is patchy.
@@ -122,6 +129,7 @@ class Engine:
             .eval()
             .to(DEVICE)
         )
+        self.started = time.monotonic()
         self.model = model
         base = model.model
         cfg = model.config
@@ -368,6 +376,9 @@ class Engine:
 
             timings = []
             for name, fused, split, gqa, tune in candidates:
+                if timings and time.monotonic() - self.started > TUNE_BUDGET_S:
+                    print("[engine] tuning budget spent; keeping best so far", flush=True)
+                    break
                 self.fused_attn, self.split_attn, self.gqa = fused, split, gqa
                 self.attn_tune = tune
                 timings.append((self._time_decode(), name, fused, split, gqa, tune))
@@ -871,9 +882,15 @@ class Engine:
             # splits > 1 spreads a narrow output over more programs; splits
             # of 1 is the single-pass kernel. Kept small so the whole search,
             # including Triton compiling each variant, fits the load budget.
-            grid = [(bn, 64, w, 3, sp)
-                    for bn in (64, 128) for w in (4, 8) for sp in (1, 8)]
+            # BLOCK_K sets how many contiguous bytes each row of the weight
+            # tile reads, which is the coalescing knob for a kernel that is
+            # waiting on memory; it belongs in the search.
+            grid = [(bn, bk, 8, 3, sp)
+                    for bn in (64, 128) for bk in (64, 128) for sp in (1, 8)]
             for blocks in grid:
+                if time.monotonic() - self.started > TUNE_BUDGET_S:
+                    print("[engine] tuning budget spent; keeping best so far", flush=True)
+                    break
                 try:
                     *tile, splits = blocks
                     got = (_k_skinny_split(probe, self.layers[0]["qkv"], *tile, splits)
@@ -906,6 +923,8 @@ class Engine:
             self.gemm_choice = {key: best_blocks for key, _ in shapes}
             current = best_ms
             for key, _ in shapes:
+                if time.monotonic() - self.started > TUNE_BUDGET_S:
+                    break
                 self.gemm_choice.pop(key)
                 without = self._time_decode()
                 if without < current:
