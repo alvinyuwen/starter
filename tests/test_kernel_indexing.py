@@ -301,6 +301,81 @@ def simulate_split_matmul(x, w, splits, block_n=64):
     return part.sum(0)
 
 
+def simulate_gqa_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale, block_n=64):
+    """Mirror _decode_attn_gqa_kernel: one program per KV head covering all of
+    its query heads.
+
+    The claim under test is that query heads kv_head*groups + 0..groups-1 are
+    exactly the heads that map to kv_head under h // groups. If that mapping is
+    off, every head still produces a plausible-looking vector - it is just
+    attending with the wrong keys - so this is checked against SDPA directly.
+    """
+    batch, _, _, head_dim = q.shape
+    capacity = cache_k.shape[2]
+    groups = heads // kv_heads
+    length = int(pos.item()) + 1
+    out = torch.zeros(batch * heads, head_dim, dtype=torch.float32)
+
+    for pid in range(batch * kv_heads):
+        batch_id = pid // kv_heads
+        kv_head = pid % kv_heads
+        rows = [batch_id * heads + kv_head * groups + g for g in range(groups)]
+        qg = q.reshape(-1, head_dim)[rows].float()          # [groups, D]
+
+        k_all = cache_k[batch_id, kv_head, :length, :].float()
+        v_all = cache_v[batch_id, kv_head, :length, :].float()
+
+        m_i = torch.full((groups,), float("-inf"))
+        l_i = torch.zeros(groups)
+        acc = torch.zeros(groups, head_dim)
+
+        for start in range(0, length, block_n):
+            k = k_all[start:start + block_n]
+            v = v_all[start:start + block_n]
+            scores = (qg @ k.T) * scale
+            m_new = torch.maximum(m_i, scores.max(dim=1).values)
+            alpha = torch.where(torch.isinf(m_i), torch.zeros_like(m_i), (m_i - m_new).exp())
+            p = (scores - m_new[:, None]).exp()
+            acc = acc * alpha[:, None] + p @ v
+            l_i = l_i * alpha + p.sum(dim=1)
+            m_i = m_new
+
+        out[rows] = acc / l_i[:, None]
+
+    return out.reshape(batch, 1, heads * head_dim)
+
+
+def check_gqa_attention():
+    results = []
+    for batch, heads, kv_heads, head_dim, capacity, pos in [
+        (1, 8, 2, 128, 64, 40),
+        (4, 32, 8, 128, 600, 511),   # the real head ratio
+        (2, 8, 8, 64, 40, 9),        # no grouping at all
+        (3, 8, 1, 64, 32, 0),        # every head shares one, single key
+    ]:
+        torch.manual_seed(batch * 41 + pos)
+        q = torch.randn(batch, 1, heads, head_dim, dtype=DTYPE)
+        ck = torch.randn(batch, kv_heads, capacity, head_dim, dtype=DTYPE)
+        cv = torch.randn(batch, kv_heads, capacity, head_dim, dtype=DTYPE)
+        p = torch.tensor([pos], dtype=torch.int64)
+        scale = head_dim**-0.5
+
+        got = simulate_gqa_attention(q, ck, cv, p, heads, kv_heads, scale)
+        keep = pos + 1
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            ck[:, :, :keep, :].repeat_interleave(heads // kv_heads, dim=1),
+            cv[:, :, :keep, :].repeat_interleave(heads // kv_heads, dim=1),
+            scale=scale,
+        ).transpose(1, 2).reshape(batch, 1, heads * head_dim)
+
+        ok = torch.allclose(got, ref, atol=1e-4, rtol=1e-4)
+        results.append(ok)
+        print(f"{'PASS' if ok else 'FAIL'}  gqa attn b={batch} hq={heads} hkv={kv_heads} "
+              f"pos={pos}{'' if ok else f'  maxdiff {(got - ref).abs().max():.3e}'}")
+    return results
+
+
 def check_split_matmul():
     results = []
     for rows, n, k, splits in [(1, 2560, 9728, 8), (16, 6144, 2560, 8),
@@ -386,6 +461,7 @@ def main():
     results.extend(check_decode_attention())
     results.extend(check_split_attention())
     results.extend(check_split_matmul())
+    results.extend(check_gqa_attention())
 
     print()
     if all(results):

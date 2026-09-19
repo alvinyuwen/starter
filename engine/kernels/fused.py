@@ -639,6 +639,94 @@ def kv_to_cache(qkv, weight, cos, sin, positions, cache_k, cache_v,
 
 
 @triton.jit
+def _decode_attn_gqa_kernel(
+    q_ptr, k_ptr, v_ptr, out_ptr, pos_ptr,
+    heads, kv_heads, capacity, head_dim, groups, scale,
+    BLOCK_G: tl.constexpr, BLOCK_N: tl.constexpr, D_BLOCK: tl.constexpr,
+):
+    """Decode attention with one program per KV head, not per query head.
+
+    Qwen3 has 32 query heads over 8 KV heads, so four query heads share every
+    cached key and value. A program per query head therefore reads the same
+    cache four times: at batch 16 that turns 1.36 GB of KV traffic into 5.44,
+    which is most of the difference between the KV read running at 0.45 TB/s
+    and the 1.85 TB/s the weight reads achieve.
+
+    Here one program owns a KV head and all four of its query heads, so each
+    key and value block is loaded once and used four times. The four heads keep
+    separate running maxima and sums, which is what the row axis of the tiles
+    carries.
+    """
+    pid = tl.program_id(0)
+    batch_id = pid // kv_heads
+    kv_head = pid % kv_heads
+
+    offs_g = tl.arange(0, BLOCK_G)
+    g_mask = offs_g < groups
+    lane = tl.arange(0, D_BLOCK)
+    d_mask = lane < head_dim
+
+    # The four query heads sharing this KV head are contiguous: head h uses
+    # KV head h // groups, so they are kv_head*groups + 0..groups-1.
+    q_rows = (batch_id * heads + kv_head * groups + offs_g)
+    q = tl.load(
+        q_ptr + q_rows[:, None] * head_dim + lane[None, :],
+        mask=g_mask[:, None] & d_mask[None, :], other=0.0,
+    )
+
+    length = tl.load(pos_ptr) + 1
+    kv_base = (batch_id * kv_heads + kv_head) * capacity * head_dim
+
+    m_i = tl.full([BLOCK_G], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_G], tl.float32)
+    acc = tl.zeros([BLOCK_G, D_BLOCK], tl.float32)
+
+    for start in range(0, length, BLOCK_N):
+        idx = start + tl.arange(0, BLOCK_N)
+        key_mask = idx < length
+        offsets = kv_base + idx[:, None] * head_dim + lane[None, :]
+        both = key_mask[:, None] & d_mask[None, :]
+
+        k = tl.load(k_ptr + offsets, mask=both, other=0.0)
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
+        scores = tl.where(key_mask[None, :], scores, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+
+        v = tl.load(v_ptr + offsets, mask=both, other=0.0)
+        # p narrows to the value dtype before the second product, which is what
+        # a flash-attention epilogue does; the accumulator stays FP32.
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    tl.store(
+        out_ptr + q_rows[:, None] * head_dim + lane[None, :],
+        (acc / l_i[:, None]).to(out_ptr.dtype.element_ty),
+        mask=g_mask[:, None] & d_mask[None, :],
+    )
+
+
+def decode_attention_gqa(q, cache_k, cache_v, pos, heads, kv_heads, scale,
+                         block_n=64, num_warps=4):
+    """Decode attention that reads each cached key and value exactly once."""
+    batch, _, _, head_dim = q.shape
+    groups = heads // kv_heads
+    out = torch.empty(batch, 1, heads * head_dim, dtype=q.dtype, device=q.device)
+    _decode_attn_gqa_kernel[(batch * kv_heads,)](
+        q, cache_k, cache_v, out, pos,
+        heads, kv_heads, cache_k.shape[2], head_dim, groups, scale,
+        BLOCK_G=max(16, triton.next_power_of_2(groups)),
+        BLOCK_N=block_n,
+        D_BLOCK=triton.next_power_of_2(head_dim),
+        num_warps=num_warps,
+    )
+    return out
+
+
+@triton.jit
 def _split_attn_kernel(
     q_ptr, k_ptr, v_ptr, acc_ptr, stat_ptr, pos_ptr,
     heads, kv_heads, capacity, head_dim, groups, scale, splits,

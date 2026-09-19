@@ -58,10 +58,11 @@ try:
         decode_attention as _k_attn,
         norm_rope as _k_norm_rope,
         decode_attention_split as _k_attn_split,
+        decode_attention_gqa as _k_attn_gqa,
     )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = _k_kv_cache = _k_skinny = _k_skinny_split = _k_skinny_t = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_gqa = _k_attn_split = _k_add_norm = _k_kv_cache = _k_skinny = _k_skinny_split = _k_skinny_t = None
 
 
 class _Ready:
@@ -224,13 +225,13 @@ class Engine:
         self.fused_rope = False
         self.fused_swiglu = False
         self.fused_attn = False
-        self.split_attn = False
         self.fused_add_norm = False
         self.fused_kv_cache = False
         self.gemm_blocks = None
         self.gemm_choice = {}
         self.prefill_fused = True
         self.attn_tune = (64, 4)
+        self.attn_kind = "plain"
         self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
@@ -383,30 +384,34 @@ class Engine:
             # and the right answer differs between one sequence and sixteen.
             candidates = []
             for tune in ((64, 4), (128, 4), (64, 8), (128, 8)):
+                # One program per KV head reads each cached key once instead of
+                # once per query head, so it is the first thing to try.
+                if getattr(self, "gqa_ok", False):
+                    candidates.append((f"gqa{tune}", True, "gqa", supports_gqa, tune))
                 if self.fused_attn:
-                    candidates.append((f"triton{tune}", True, False, supports_gqa, tune))
+                    candidates.append((f"plain{tune}", True, "plain", supports_gqa, tune))
                 if getattr(self, "split_ok", False):
-                    candidates.append((f"split{tune}", True, True, supports_gqa, tune))
+                    candidates.append((f"split{tune}", True, "split", supports_gqa, tune))
             if supports_gqa:
-                candidates.append(("enable_gqa", False, False, True, (64, 4)))
-            candidates.append(("repeat_kv", False, False, False, (64, 4)))
+                candidates.append(("sdpa_gqa", False, "plain", True, (64, 4)))
+            candidates.append(("repeat_kv", False, "plain", False, (64, 4)))
 
             timings = []
-            for name, fused, split, gqa, tune in candidates:
+            for name, fused, kind, gqa, tune in candidates:
                 if timings and time.monotonic() - self.started > TUNE_BUDGET_S:
                     print("[engine] tuning budget spent; keeping best so far", flush=True)
                     break
-                self.fused_attn, self.split_attn, self.gqa = fused, split, gqa
+                self.fused_attn, self.attn_kind, self.gqa = fused, kind, gqa
                 self.attn_tune = tune
-                timings.append((self._time_decode(), name, fused, split, gqa, tune))
+                timings.append((self._time_decode(), name, fused, kind, gqa, tune))
 
-            (best_ms, best_name, self.fused_attn, self.split_attn,
+            (best_ms, best_name, self.fused_attn, self.attn_kind,
              self.gqa, self.attn_tune) = min(timings)
             summary = ", ".join(f"{n} {ms:.3f}" for ms, n, *_ in timings)
             print(f"[engine] decode step: {summary} -> {best_name}", flush=True)
         except Exception as exc:  # noqa: BLE001 - timing must never fail a run
             print(f"[engine] attention timing failed ({exc}); falling back", flush=True)
-            self.fused_attn, self.split_attn, self.gqa = False, False, supports_gqa
+            self.fused_attn, self.attn_kind, self.gqa = False, "plain", supports_gqa
             self.attn_tune = (64, 4)
         finally:
             self.g_pos.zero_()
@@ -630,10 +635,16 @@ class Engine:
                     )
 
                 self.fused_attn = matches(got)
-                split_ok = matches(
+                self.split_ok = matches(
                     _k_attn_split(q, ck, cv, probe, self.HEADS, self.KV_HEADS, self.SCALE)
                 )
-                self.split_ok = split_ok
+                try:
+                    self.gqa_ok = matches(
+                        _k_attn_gqa(q, ck, cv, probe, self.HEADS, self.KV_HEADS, self.SCALE)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[engine] gqa attention unavailable ({exc})", flush=True)
+                    self.gqa_ok = False
                 if not self.fused_attn:
                     delta = (got.float() - ref.float()).abs().max().item()
                     print(f"[engine] fused attention off, max delta {delta:.3e}", flush=True)
@@ -641,6 +652,7 @@ class Engine:
                 print(f"[engine] fused attention unavailable ({exc})", flush=True)
                 self.fused_attn = False
                 self.split_ok = False
+                self.gqa_ok = False
         print(
             f"[engine] fused kernels: norm={self.fused_norm} rope={self.fused_rope} "
             f"swiglu={self.fused_swiglu} norm_rope={self.fused_norm_rope} "
@@ -709,7 +721,7 @@ class Engine:
             # Writes [batch, 1, heads * head_dim] directly, which is already
             # the layout o_proj wants - the SDPA path needs a transpose and a
             # copy to get there.
-            fn = _k_attn_split if self.split_attn else _k_attn
+            fn = {"gqa": _k_attn_gqa, "split": _k_attn_split}.get(self.attn_kind, _k_attn)
             a = fn(q, ck, cv, position, self.HEADS, self.KV_HEADS, self.SCALE,
                    *self.attn_tune)
         else:
