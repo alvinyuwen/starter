@@ -189,6 +189,7 @@ class Engine:
         self.g_out = None
         self.g_arange = None
         self.gqa = None
+        self.time_probe = 0
         self.fused_norm = False
         self.fused_rope = False
         self.fused_swiglu = False
@@ -251,15 +252,24 @@ class Engine:
             return False
 
     def _time_decode(self, iters: int = 12) -> float:
-        """Median-ish seconds per eager decode step, for picking between paths."""
+        """Milliseconds per decode step, for picking between attention paths.
+
+        Timed at a position partway through the generation, not at zero. The
+        cost of every candidate depends on how many keys are live: at position
+        zero a streaming kernel reads one block while SDPA still builds a
+        full-capacity mask, which flatters the kernel and picked it for shapes
+        where it loses badly. Timing where the workload actually spends its
+        steps is the only comparison that means anything.
+        """
+        probe = min(self.time_probe, self.capacity - 1)
         for _ in range(3):
-            self.g_pos.zero_()
+            self.g_pos.fill_(probe)
             self._forward_decode()
         torch.cuda.synchronize()
         start, stop = torch.cuda.Event(True), torch.cuda.Event(True)
         start.record()
         for _ in range(iters):
-            self.g_pos.zero_()
+            self.g_pos.fill_(probe)
             self._forward_decode()
         stop.record()
         torch.cuda.synchronize()
@@ -579,6 +589,9 @@ class Engine:
 
         self.batch = batch
         self.capacity = capacity
+        # Midpoint of the decode range: the position a typical step runs at,
+        # and therefore the only honest place to compare attention paths.
+        self.time_probe = seq_len + max_new_tokens // 2
         self.g_token = torch.zeros(batch, 1, dtype=torch.int64, device=DEVICE)
         self.g_pos = torch.zeros(1, dtype=torch.int64, device=DEVICE)
         self.g_arange = torch.arange(capacity, dtype=torch.int64, device=DEVICE)
@@ -606,7 +619,7 @@ class Engine:
                 for _ in range(3):
                     # Rewind each time: _forward_decode advances the position,
                     # and three unchecked steps would index past a small cache.
-                    self.g_pos.zero_()
+                    self.g_pos.fill_(min(self.time_probe, self.capacity - 1))
                     self._forward_decode()
             self.g_pos.zero_()
             torch.cuda.current_stream().wait_stream(side)
