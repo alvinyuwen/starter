@@ -113,6 +113,74 @@ def _swiglu_kernel(x_ptr, out_ptr, inner, n_elements, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _norm_rope_kernel(
+    x_ptr, out_ptr, w_ptr, cos_ptr, sin_ptr,
+    tokens, heads, head_dim, half, eps,
+    HALF_BLOCK: tl.constexpr,
+):
+    """Per-head RMSNorm followed by RoPE, in one pass over the row.
+
+    These always run back to back on q and on k, and both are row-local, so
+    reading the row once and doing both saves a launch and a round trip to
+    memory at each of the four sites per layer.
+
+    RoPE pairs lane j with j + half, so the row is loaded in halves; the
+    variance reduction simply sums both halves, which is the same sum over the
+    same values.
+    """
+    row = tl.program_id(0)
+    token = (row // heads) % tokens
+
+    lane = tl.arange(0, HALF_BLOCK)
+    mask = lane < half
+    lo_off = row * head_dim + lane
+    hi_off = lo_off + half
+
+    lo = tl.load(x_ptr + lo_off, mask=mask, other=0.0)
+    hi = tl.load(x_ptr + hi_off, mask=mask, other=0.0)
+    out_dtype = out_ptr.dtype.element_ty
+
+    # RMSNorm: reduce in FP32, round the normalised value to the working dtype,
+    # then multiply by the weight - the reference's cast placement exactly.
+    f_lo = lo.to(tl.float32)
+    f_hi = hi.to(tl.float32)
+    variance = (tl.sum(f_lo * f_lo, axis=0) + tl.sum(f_hi * f_hi, axis=0)) / head_dim
+    inv = tl.math.rsqrt(variance + eps)
+    w_lo = tl.load(w_ptr + lane, mask=mask, other=0.0)
+    w_hi = tl.load(w_ptr + lane + half, mask=mask, other=0.0)
+    n_lo = (f_lo * inv).to(out_dtype) * w_lo
+    n_hi = (f_hi * inv).to(out_dtype) * w_hi
+
+    angle = token * head_dim + lane
+    cos_lo = tl.load(cos_ptr + angle, mask=mask, other=0.0)
+    sin_lo = tl.load(sin_ptr + angle, mask=mask, other=0.0)
+    cos_hi = tl.load(cos_ptr + angle + half, mask=mask, other=0.0)
+    sin_hi = tl.load(sin_ptr + angle + half, mask=mask, other=0.0)
+
+    a_lo = (n_lo.to(tl.float32) * cos_lo.to(tl.float32)).to(out_dtype)
+    b_lo = ((-n_hi).to(tl.float32) * sin_lo.to(tl.float32)).to(out_dtype)
+    a_hi = (n_hi.to(tl.float32) * cos_hi.to(tl.float32)).to(out_dtype)
+    b_hi = (n_lo.to(tl.float32) * sin_hi.to(tl.float32)).to(out_dtype)
+
+    tl.store(out_ptr + lo_off, (a_lo.to(tl.float32) + b_lo.to(tl.float32)).to(out_dtype), mask=mask)
+    tl.store(out_ptr + hi_off, (a_hi.to(tl.float32) + b_hi.to(tl.float32)).to(out_dtype), mask=mask)
+
+
+def norm_rope(x, weight, cos, sin, eps):
+    """RMSNorm over each head then RoPE, on ``[batch, tokens, heads, head_dim]``."""
+    batch, tokens, heads, head_dim = x.shape
+    half = head_dim // 2
+    out = torch.empty_like(x)
+    _norm_rope_kernel[(batch * tokens * heads,)](
+        x, out, weight, cos, sin,
+        tokens, heads, head_dim, half, eps,
+        HALF_BLOCK=triton.next_power_of_2(half),
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
 def _decode_attn_kernel(
     q_ptr, k_ptr, v_ptr, out_ptr, pos_ptr,
     heads, kv_heads, capacity, head_dim, groups, scale,

@@ -44,10 +44,11 @@ try:
         rope as _k_rope,
         swiglu as _k_swiglu,
         decode_attention as _k_attn,
+        norm_rope as _k_norm_rope,
     )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = None
 
 
 class _Ready:
@@ -192,6 +193,7 @@ class Engine:
         self.fused_rope = False
         self.fused_swiglu = False
         self.fused_attn = False
+        self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
     # ------------------------------------------------------------------ rope
@@ -312,6 +314,12 @@ class Engine:
             return _k_rope(q, cos, sin), _k_rope(k, cos, sin)
         return apply_rope(q, k, cos, sin)
 
+    def _norm_rope_pair(self, q, k, qw, kw, cos, sin):
+        if self.fused_norm_rope:
+            return (_k_norm_rope(q, qw, cos, sin, self.EPS),
+                    _k_norm_rope(k, kw, cos, sin, self.EPS))
+        return self._rope(self._norm(q, qw), self._norm(k, kw), cos, sin)
+
     def _swiglu(self, fused):
         if self.fused_swiglu:
             return _k_swiglu(fused)
@@ -335,7 +343,7 @@ class Engine:
         inner = self.layers[0]["gate_up"].shape[0] // 2
         weight = self.layers[0]["in_ln"]
         head_w = self.layers[0]["q_norm"]
-        verdict = {"norm": True, "rope": True, "swiglu": True}
+        verdict = {"norm": True, "rope": True, "swiglu": True, "norm_rope": True}
 
         # Both shapes that reach these kernels: the single-token decode step and
         # a multi-token prefill chunk. The index arithmetic differs between them
@@ -358,6 +366,9 @@ class Engine:
                  lambda: apply_rope(heads, heads, cos, sin)[0]),
                 ("swiglu", lambda: _k_swiglu(gate_up),
                  lambda: F.silu(gate_up.chunk(2, dim=-1)[0]) * gate_up.chunk(2, dim=-1)[1]),
+                ("norm_rope", lambda: _k_norm_rope(heads, head_w, cos, sin, self.EPS),
+                 lambda: apply_rope(rms_norm(heads, head_w, self.EPS),
+                                    rms_norm(heads, head_w, self.EPS), cos, sin)[0]),
             )
             for name, fused_fn, eager_fn in checks:
                 try:
@@ -372,6 +383,8 @@ class Engine:
         self.fused_norm = verdict["norm"]
         self.fused_rope = verdict["rope"]
         self.fused_swiglu = verdict["swiglu"]
+        # Only worth taking if both halves it replaces are themselves sound.
+        self.fused_norm_rope = verdict["norm_rope"]
 
         # Attention is a reduction over keys, so a flash-style streaming order
         # will not reproduce SDPA bit for bit the way the elementwise kernels
@@ -408,7 +421,7 @@ class Engine:
                 self.fused_attn = False
         print(
             f"[engine] fused kernels: norm={self.fused_norm} rope={self.fused_rope} "
-            f"swiglu={self.fused_swiglu}",
+            f"swiglu={self.fused_swiglu} norm_rope={self.fused_norm_rope}",
             flush=True,
         )
 
@@ -430,15 +443,17 @@ class Engine:
 
         # Per-head RMSNorm over the 128-wide head dimension, before RoPE.
         # Qwen3 norms q and k; never v.
-        q = self._norm(q.view(batch, tokens, self.HEADS, self.HEAD_DIM), layer["q_norm"])
-        k = self._norm(k.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM), layer["k_norm"])
+        q, k = self._norm_rope_pair(
+            q.view(batch, tokens, self.HEADS, self.HEAD_DIM),
+            k.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM),
+            layer["q_norm"], layer["k_norm"], cos, sin,
+        )
 
         # RoPE runs here, on [B, T, H, D], rather than after the transpose as
         # the reference writes it. It is elementwise per (batch, token, head)
         # row and indexed only by token, so the result is identical - but the
         # tensor is still contiguous, which is what lets a fused kernel read it
         # with a single stride instead of a transposed one.
-        q, k = self._rope(q, k, cos, sin)
         k_t = k.transpose(1, 2)
         v_t = v.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM).transpose(1, 2)
 

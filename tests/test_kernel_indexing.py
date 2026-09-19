@@ -118,6 +118,51 @@ def simulate_decode_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale, 
     return out.reshape(batch, 1, heads * head_dim)
 
 
+def simulate_norm_rope(x, weight, cos, sin, eps, heads, head_dim, tokens):
+    """Mirror _norm_rope_kernel: the variance sums both halves of the row,
+    which is the same sum over the same values as a whole-row reduction."""
+    batch = x.shape[0]
+    rows = batch * tokens * heads
+    half = head_dim // 2
+    flat = x.reshape(rows, head_dim)
+
+    lo, hi = flat[:, :half].float(), flat[:, half:].float()
+    variance = ((lo * lo).sum(1) + (hi * hi).sum(1)) / head_dim
+    inv = torch.rsqrt(variance + eps).unsqueeze(1)
+    n_lo = (lo * inv).to(x.dtype) * weight[:half]
+    n_hi = (hi * inv).to(x.dtype) * weight[half:]
+
+    token = (torch.arange(rows) // heads) % tokens
+    c_lo, s_lo = cos[token][:, :half], sin[token][:, :half]
+    c_hi, s_hi = cos[token][:, half:], sin[token][:, half:]
+
+    out = torch.empty_like(flat)
+    out[:, :half] = n_lo * c_lo + (-n_hi) * s_lo
+    out[:, half:] = n_hi * c_hi + n_lo * s_hi
+    return out.reshape(x.shape)
+
+
+def check_norm_rope():
+    results = []
+    for batch, tokens, heads, head_dim in [(1, 1, 8, 128), (4, 1, 8, 128), (2, 6, 4, 128)]:
+        torch.manual_seed(batch * 7 + tokens)
+        x = torch.randn(batch, tokens, heads, head_dim, dtype=DTYPE)
+        w = torch.randn(head_dim, dtype=DTYPE)
+        cos = torch.randn(tokens, head_dim, dtype=DTYPE)
+        sin = torch.randn(tokens, head_dim, dtype=DTYPE)
+        eps = 1e-6
+
+        normed = engine_mod.rms_norm(x, w, eps)
+        want, _ = engine_mod.apply_rope(normed, normed, cos, sin)
+        got = simulate_norm_rope(x, w, cos, sin, eps, heads, head_dim, tokens)
+
+        ok = torch.allclose(want, got, atol=1e-5, rtol=1e-5)
+        results.append(ok)
+        print(f"{'PASS' if ok else 'FAIL'}  norm+rope b={batch} t={tokens} h={heads}"
+              f"{'' if ok else f'  maxdiff {(want - got).abs().max():.3e}'}")
+    return results
+
+
 def check_decode_attention():
     results = []
     for batch, heads, kv_heads, head_dim, capacity, pos in [
@@ -179,6 +224,7 @@ def main():
         results.append(ok)
         print(f"{'PASS' if ok else 'FAIL'}  swiglu indexing rows={rows} inner={inner}")
 
+    results.extend(check_norm_rope())
     results.extend(check_decode_attention())
 
     print()
