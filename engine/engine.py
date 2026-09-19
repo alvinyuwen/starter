@@ -202,6 +202,7 @@ class Engine:
         self.fused_add_norm = False
         self.fused_kv_cache = False
         self.gemm_blocks = None
+        self.gemm_choice = {}
         self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
@@ -392,8 +393,10 @@ class Engine:
         comfortably; the skinny kernel exists for the one-to-sixteen row case
         where the cost is purely streaming the weights.
         """
-        if self.gemm_blocks is not None and x.shape[0] * x.shape[1] <= 32:
-            return _k_skinny(x, weight, *self.gemm_blocks)
+        if x.shape[0] * x.shape[1] <= 32:
+            blocks = self.gemm_choice.get((weight.shape[0], weight.shape[1]))
+            if blocks is not None:
+                return _k_skinny(x, weight, *blocks)
         return F.linear(x, weight)
 
     def _add_norm(self, residual, delta, weight):
@@ -795,53 +798,84 @@ class Engine:
         self._capture()
 
     def _select_gemm(self) -> None:
-        """Decide whether the skinny matmul beats cuBLAS, and at which tiling.
+        """Decide, per weight shape, whether the skinny matmul beats cuBLAS.
 
-        Decode is weight-bandwidth bound - the measured rate barely moves
-        between batch 1 and batch 16 - so this is where the remaining time is.
-        Whether a hand-tiled kernel actually beats a heavily tuned library at
-        these shapes is not something to assume from here, so it is measured,
-        including against leaving it off.
+        Decode is weight-bandwidth bound, so this is where the remaining time
+        is. Measurement rather than assumption, for two reasons: whether a
+        hand-tiled kernel beats a tuned library at these shapes is not knowable
+        from a machine with no GPU, and the answer is not even the same across
+        shapes - at batch 1 it won by 30%, at batch 16 it lost by 18%.
+
+        Two passes. First pick a tiling using every weight at once, then take
+        that tiling and test each weight shape on its own, keeping the kernel
+        only where it actually helps. Greedy, but it costs a handful of
+        captures rather than the full cross product.
         """
+        self.gemm_choice = {}
         if not self.cuda or _k_skinny is None:
-            self.gemm_blocks = None
             return
+
+        shapes = []
+        for weight in (self.layers[0]["qkv"], self.layers[0]["o"],
+                       self.layers[0]["gate_up"], self.layers[0]["down"],
+                       self.lm_head_w):
+            key = (weight.shape[0], weight.shape[1])
+            if key not in [s for s, _ in shapes]:
+                shapes.append((key, weight))
+
         try:
-            # Correctness first. A matmul sums thousands of terms, so the order
-            # differs from cuBLAS's and equality is the wrong test; this is the
-            # same reordering budget the attention kernel spends.
+            # Accuracy gate. A matmul sums thousands of terms, so its order
+            # differs from cuBLAS's and equality is the wrong test - this is
+            # the reordering budget the contract allows, not an approximation.
             probe = torch.randn(self.batch, 1, self.HIDDEN, dtype=self.dtype, device=DEVICE)
-            weight = self.layers[0]["qkv"]
-            reference = F.linear(probe, weight)
+            reference = F.linear(probe, self.layers[0]["qkv"])
             usable = []
-            for block_n, block_k in ((64, 64), (128, 64), (64, 128), (128, 128)):
+            for blocks in ((64, 64), (128, 64), (64, 128), (128, 128)):
                 try:
-                    got = _k_skinny(probe, weight, block_n, block_k)
+                    got = _k_skinny(probe, self.layers[0]["qkv"], *blocks)
                 except Exception:  # noqa: BLE001 - a tiling that will not compile
                     continue
                 if torch.isfinite(got).all() and torch.allclose(
                     got.float(), reference.float(), atol=2e-2, rtol=2e-2
                 ):
-                    usable.append((block_n, block_k))
+                    usable.append(blocks)
             if not usable:
                 print("[engine] skinny matmul rejected on accuracy", flush=True)
-                self.gemm_blocks = None
                 return
 
-            self.gemm_blocks = None
-            timings = [(self._time_decode(), None)]
+            baseline = self._time_decode()
+            best_ms, best_blocks = baseline, None
             for blocks in usable:
-                self.gemm_blocks = blocks
-                timings.append((self._time_decode(), blocks))
-            best_ms, self.gemm_blocks = min(timings)
-            summary = ", ".join(
-                f"{'cublas' if b is None else f'{b[0]}x{b[1]}'} {ms:.3f} ms" for ms, b in timings
+                self.gemm_choice = {key: blocks for key, _ in shapes}
+                elapsed = self._time_decode()
+                if elapsed < best_ms:
+                    best_ms, best_blocks = elapsed, blocks
+
+            if best_blocks is None:
+                self.gemm_choice = {}
+                print(f"[engine] decode matmul: cublas ({baseline:.3f} ms)", flush=True)
+                return
+
+            # Now drop it from any shape it does not earn its place on.
+            self.gemm_choice = {key: best_blocks for key, _ in shapes}
+            current = best_ms
+            for key, _ in shapes:
+                self.gemm_choice.pop(key)
+                without = self._time_decode()
+                if without < current:
+                    current = without
+                else:
+                    self.gemm_choice[key] = best_blocks
+
+            kept = [f"{k[0]}x{k[1]}" for k in self.gemm_choice]
+            print(
+                f"[engine] decode matmul: cublas {baseline:.3f} ms -> {current:.3f} ms "
+                f"with {best_blocks} on {kept or 'nothing'}",
+                flush=True,
             )
-            print(f"[engine] decode matmul: {summary} -> "
-                  f"{'cublas' if self.gemm_blocks is None else self.gemm_blocks}", flush=True)
         except Exception as exc:  # noqa: BLE001 - never let tuning fail a run
             print(f"[engine] matmul tuning failed ({exc}); cublas", flush=True)
-            self.gemm_blocks = None
+            self.gemm_choice = {}
         finally:
             self.g_pos.zero_()
 
