@@ -119,12 +119,24 @@ def simulate_decode_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale, 
 
 
 def simulate_norm_rope(x, weight, cos, sin, eps, heads, head_dim, tokens):
-    """Mirror _norm_rope_kernel: the variance sums both halves of the row,
-    which is the same sum over the same values as a whole-row reduction."""
+    """Mirror _norm_rope_kernel, including its stride handling.
+
+    The kernel reads through the tensor's real token stride rather than
+    assuming a packed layout, because in production x is q or k sliced out of
+    the fused QKV projection and its rows are wider than heads*head_dim.
+    Gathering by explicit offsets here reproduces that.
+    """
     batch = x.shape[0]
     rows = batch * tokens * heads
     half = head_dim // 2
-    flat = x.reshape(rows, head_dim)
+
+    # The kernel decomposes its program id into (batch, token, head) and then
+    # walks the tensor's real token stride. Gathering by that decomposition
+    # reproduces what it reads, for a packed tensor and a strided view alike.
+    row = torch.arange(rows)
+    bt, head = row // heads, row % heads
+    b, t = bt // tokens, bt % tokens
+    flat = x[b, t, head, :]
 
     lo, hi = flat[:, :half].float(), flat[:, half:].float()
     variance = ((lo * lo).sum(1) + (hi * hi).sum(1)) / head_dim
@@ -144,9 +156,17 @@ def simulate_norm_rope(x, weight, cos, sin, eps, heads, head_dim, tokens):
 
 def check_norm_rope():
     results = []
-    for batch, tokens, heads, head_dim in [(1, 1, 8, 128), (4, 1, 8, 128), (2, 6, 4, 128)]:
-        torch.manual_seed(batch * 7 + tokens)
-        x = torch.randn(batch, tokens, heads, head_dim, dtype=DTYPE)
+    cases = [(1, 1, 8, 128, False), (4, 1, 8, 128, False), (2, 6, 4, 128, False),
+             # The layout production actually passes: a slice of a wider row.
+             (2, 5, 8, 128, True), (4, 1, 8, 128, True), (1, 7, 2, 128, True)]
+    for batch, tokens, heads, head_dim, strided in cases:
+        torch.manual_seed(batch * 7 + tokens + int(strided))
+        if strided:
+            wide = torch.randn(batch, tokens, heads * head_dim * 2 + 64, dtype=DTYPE)
+            x = wide[..., :heads * head_dim].view(batch, tokens, heads, head_dim)
+            assert not x.is_contiguous(), "case should exercise the strided path"
+        else:
+            x = torch.randn(batch, tokens, heads, head_dim, dtype=DTYPE)
         w = torch.randn(head_dim, dtype=DTYPE)
         cos = torch.randn(tokens, head_dim, dtype=DTYPE)
         sin = torch.randn(tokens, head_dim, dtype=DTYPE)
@@ -159,6 +179,7 @@ def check_norm_rope():
         ok = torch.allclose(want, got, atol=1e-5, rtol=1e-5)
         results.append(ok)
         print(f"{'PASS' if ok else 'FAIL'}  norm+rope b={batch} t={tokens} h={heads}"
+              f"{' strided' if strided else ''}"
               f"{'' if ok else f'  maxdiff {(want - got).abs().max():.3e}'}")
     return results
 

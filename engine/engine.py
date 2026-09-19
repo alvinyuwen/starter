@@ -378,6 +378,20 @@ class Engine:
             )
             gate_up = torch.randn(batch, tokens, 2 * inner, dtype=self.dtype, device=DEVICE)
             hidden2 = torch.randn(batch, tokens, self.HIDDEN, dtype=self.dtype, device=DEVICE)
+            # q and k reach these kernels as slices of the fused QKV
+            # projection, so they are views with a row stride wider than the
+            # head block. Validating against a freshly allocated contiguous
+            # tensor tests a layout that never occurs and hides stride bugs -
+            # so build the real thing and slice it the same way _block does.
+            qkv_probe = torch.randn(
+                batch, tokens, self.q_size + 2 * self.kv_size,
+                dtype=self.dtype, device=DEVICE,
+            )
+            q_view, k_view, _ = qkv_probe.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+            q_view = q_view.view(batch, tokens, self.HEADS, self.HEAD_DIM)
+            k_view = k_view.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM)
             cos = self.cos_table[:tokens]
             sin = self.sin_table[:tokens]
 
@@ -394,9 +408,12 @@ class Engine:
                  lambda: rms_norm(hidden + hidden2, weight, self.EPS)),
                 ("add_norm_sum", lambda: _k_add_norm(hidden, hidden2, weight, self.EPS)[0],
                  lambda: hidden + hidden2),
-                ("norm_rope", lambda: _k_norm_rope(heads, head_w, cos, sin, self.EPS),
-                 lambda: apply_rope(rms_norm(heads, head_w, self.EPS),
-                                    rms_norm(heads, head_w, self.EPS), cos, sin)[0]),
+                ("norm_rope", lambda: _k_norm_rope(q_view, head_w, cos, sin, self.EPS),
+                 lambda: apply_rope(rms_norm(q_view, head_w, self.EPS),
+                                    rms_norm(q_view, head_w, self.EPS), cos, sin)[0]),
+                ("norm_rope", lambda: _k_norm_rope(k_view, head_w, cos, sin, self.EPS),
+                 lambda: apply_rope(rms_norm(k_view, head_w, self.EPS),
+                                    rms_norm(k_view, head_w, self.EPS), cos, sin)[0]),
             )
             for name, fused_fn, eager_fn in checks:
                 try:

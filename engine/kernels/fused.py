@@ -161,7 +161,7 @@ def add_norm(residual, delta, weight, eps):
 @triton.jit
 def _norm_rope_kernel(
     x_ptr, out_ptr, w_ptr, cos_ptr, sin_ptr,
-    tokens, heads, head_dim, half, eps,
+    tokens, heads, head_dim, half, eps, row_stride,
     HALF_BLOCK: tl.constexpr,
 ):
     """Per-head RMSNorm followed by RoPE, in one pass over the row.
@@ -175,12 +175,19 @@ def _norm_rope_kernel(
     same values.
     """
     row = tl.program_id(0)
-    token = (row // heads) % tokens
+    bt = row // heads               # flattened (batch, token)
+    head = row % heads
+    token = bt % tokens
 
     lane = tl.arange(0, HALF_BLOCK)
     mask = lane < half
-    lo_off = row * head_dim + lane
+    # q and k arrive as slices of the fused QKV projection, so consecutive
+    # tokens are row_stride apart, not heads*head_dim. Assuming the packed
+    # layout reads the wrong memory for every token after the first.
+    src = bt * row_stride + head * head_dim
+    lo_off = src + lane
     hi_off = lo_off + half
+    dst = row * head_dim + lane
 
     lo = tl.load(x_ptr + lo_off, mask=mask, other=0.0)
     hi = tl.load(x_ptr + hi_off, mask=mask, other=0.0)
@@ -208,18 +215,36 @@ def _norm_rope_kernel(
     a_hi = (n_hi.to(tl.float32) * cos_hi.to(tl.float32)).to(out_dtype)
     b_hi = (n_lo.to(tl.float32) * sin_hi.to(tl.float32)).to(out_dtype)
 
-    tl.store(out_ptr + lo_off, (a_lo.to(tl.float32) + b_lo.to(tl.float32)).to(out_dtype), mask=mask)
-    tl.store(out_ptr + hi_off, (a_hi.to(tl.float32) + b_hi.to(tl.float32)).to(out_dtype), mask=mask)
+    tl.store(out_ptr + dst, (a_lo.to(tl.float32) + b_lo.to(tl.float32)).to(out_dtype), mask=mask)
+    tl.store(out_ptr + dst + half, (a_hi.to(tl.float32) + b_hi.to(tl.float32)).to(out_dtype), mask=mask)
 
 
 def norm_rope(x, weight, cos, sin, eps):
-    """RMSNorm over each head then RoPE, on ``[batch, tokens, heads, head_dim]``."""
+    """RMSNorm over each head then RoPE, on ``[batch, tokens, heads, head_dim]``.
+
+    ``x`` may be a non-contiguous slice of a wider tensor - which is exactly
+    what it is in practice, being q or k carved out of the fused QKV
+    projection - so its row stride is read from the tensor rather than assumed.
+    The output is always freshly packed, so everything downstream can rely on
+    it being contiguous.
+    """
     batch, tokens, heads, head_dim = x.shape
     half = head_dim // 2
-    out = torch.empty_like(x)
+
+    # Triton is handed x.data_ptr(), which already accounts for the view's
+    # storage offset, so only the strides matter here. Heads and lanes must be
+    # packed; the token stride may be wider than heads*head_dim, which is the
+    # normal case when x is q or k sliced out of the fused QKV projection.
+    batch_stride, token_stride, head_stride, lane_stride = x.stride()
+    if (head_stride != head_dim or lane_stride != 1
+            or batch_stride != tokens * token_stride):
+        x = x.contiguous()
+        batch_stride, token_stride, head_stride, lane_stride = x.stride()
+
+    out = torch.empty(batch, tokens, heads, head_dim, dtype=x.dtype, device=x.device)
     _norm_rope_kernel[(batch * tokens * heads,)](
         x, out, weight, cos, sin,
-        tokens, heads, head_dim, half, eps,
+        tokens, heads, head_dim, half, eps, token_stride,
         HALF_BLOCK=triton.next_power_of_2(half),
         num_warps=4,
     )
