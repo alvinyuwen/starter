@@ -262,6 +262,14 @@ class Engine:
     def _time_decode(self, iters: int = 12) -> float:
         """Milliseconds per decode step, for picking between attention paths.
 
+        Timed under graph replay, because that is what the measured samples
+        run. Timing eager steps adds Python and launch overhead to every
+        kernel, which systematically favours whichever candidate issues fewer
+        launches rather than whichever is actually faster on the device - and
+        under replay that overhead is gone and the ranking can invert. That is
+        how a matmul that lost on every public shape still got selected on a
+        hidden one and cost 6% of the score.
+
         Timed at a position partway through the generation, not at zero. The
         cost of every candidate depends on how many keys are live: at position
         zero a streaming kernel reads one block while SDPA still builds a
@@ -269,7 +277,23 @@ class Engine:
         where it loses badly. Timing where the workload actually spends its
         steps is the only comparison that means anything.
         """
-        probe = min(self.time_probe, self.capacity - 1)
+        probe = min(self.time_probe, max(0, self.capacity - iters - 2))
+        graph = self._try_capture(probe)
+        if graph is not None:
+            try:
+                self.g_pos.fill_(probe)
+                torch.cuda.synchronize()
+                start, stop = torch.cuda.Event(True), torch.cuda.Event(True)
+                start.record()
+                for _ in range(iters):
+                    graph.replay()
+                stop.record()
+                torch.cuda.synchronize()
+                return start.elapsed_time(stop) / iters
+            finally:
+                del graph
+                torch.cuda.synchronize()
+
         for _ in range(3):
             self.g_pos.fill_(probe)
             self._forward_decode()
@@ -282,6 +306,32 @@ class Engine:
         stop.record()
         torch.cuda.synchronize()
         return start.elapsed_time(stop) / iters
+
+    def _try_capture(self, probe: int):
+        """Capture a throwaway graph of the current configuration, or None.
+
+        Used to price candidates the way the run will actually execute them.
+        Capture is not free, but warmup is untimed and a handful of captures
+        sit comfortably inside its budget.
+        """
+        if not self.cuda:
+            return None
+        try:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    self.g_pos.fill_(probe)
+                    self._forward_decode()
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._forward_decode()
+            return graph
+        except Exception as exc:  # noqa: BLE001 - fall back to eager timing
+            print(f"[engine] timing capture failed ({exc}); timing eager", flush=True)
+            return None
 
     def _select_attention(self, batch: int) -> None:
         """Measure the two GQA paths instead of assuming one wins.
