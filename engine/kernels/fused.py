@@ -112,6 +112,89 @@ def _swiglu_kernel(x_ptr, out_ptr, inner, n_elements, BLOCK: tl.constexpr):
     tl.store(out_ptr + offsets, value, mask=mask)
 
 
+@triton.jit
+def _decode_attn_kernel(
+    q_ptr, k_ptr, v_ptr, out_ptr, pos_ptr,
+    heads, kv_heads, capacity, head_dim, groups, scale,
+    BLOCK_N: tl.constexpr, D_BLOCK: tl.constexpr,
+):
+    """Flash-style decode attention for a single query token.
+
+    One program per (batch, query head), streaming the cache in blocks with an
+    online softmax. Two things matter more than the fusion itself:
+
+    * The valid length is read from device memory, not baked in. That is what
+      lets one captured graph serve every step - a Python slice would freeze
+      the length at capture, and the alternative, a full-capacity additive
+      mask, makes SDPA read every unused slot and pushes it onto a backend
+      that materialises the whole score row.
+    * The loop therefore runs to the real length, so the cache tail that has
+      not been written yet is never touched at all.
+    """
+    pid = tl.program_id(0)
+    batch_id = pid // heads
+    head_id = pid % heads
+    kv_head = head_id // groups
+
+    lane = tl.arange(0, D_BLOCK)
+    lane_mask = lane < head_dim
+
+    q = tl.load(q_ptr + (batch_id * heads + head_id) * head_dim + lane,
+                mask=lane_mask, other=0.0).to(tl.float32)
+
+    # pos is the slot written this step, so keys 0..pos inclusive are live.
+    length = tl.load(pos_ptr) + 1
+    kv_base = (batch_id * kv_heads + kv_head) * capacity * head_dim
+
+    m_i = float("-inf")
+    l_i = 0.0
+    acc = tl.zeros([D_BLOCK], dtype=tl.float32)
+
+    for start in range(0, length, BLOCK_N):
+        idx = start + tl.arange(0, BLOCK_N)
+        key_mask = idx < length
+        offsets = kv_base + idx[:, None] * head_dim + lane[None, :]
+        both = key_mask[:, None] & lane_mask[None, :]
+
+        k = tl.load(k_ptr + offsets, mask=both, other=0.0).to(tl.float32)
+        scores = tl.sum(q[None, :] * k, axis=1) * scale
+        scores = tl.where(key_mask, scores, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+
+        v = tl.load(v_ptr + offsets, mask=both, other=0.0).to(tl.float32)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        m_i = m_new
+
+    tl.store(out_ptr + (batch_id * heads + head_id) * head_dim + lane,
+             (acc / l_i).to(out_ptr.dtype.element_ty), mask=lane_mask)
+
+
+def decode_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale):
+    """Attention for one decode token against a fixed-capacity cache.
+
+    ``q`` is ``[batch, 1, heads, head_dim]`` contiguous, the caches are
+    ``[batch, kv_heads, capacity, head_dim]``, and ``pos`` is a device scalar
+    holding the slot just written. Returns ``[batch, 1, heads * head_dim]``,
+    already in the layout the output projection wants, which also removes the
+    transpose-and-copy the SDPA path needs.
+    """
+    batch, _, _, head_dim = q.shape
+    capacity = cache_k.shape[2]
+    out = torch.empty(batch, 1, heads * head_dim, dtype=q.dtype, device=q.device)
+    _decode_attn_kernel[(batch * heads,)](
+        q, cache_k, cache_v, out, pos,
+        heads, kv_heads, capacity, head_dim, heads // kv_heads, scale,
+        BLOCK_N=64,
+        D_BLOCK=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+    return out
+
+
 def swiglu(fused: torch.Tensor) -> torch.Tensor:
     """``silu(gate) * up`` where ``fused`` is ``[..., 2 * inner]`` contiguous."""
     inner = fused.shape[-1] // 2

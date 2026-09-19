@@ -40,10 +40,14 @@ LOAD_DTYPE = torch.bfloat16
 _kernels_error = None
 try:
     from kernels.rmsnorm import rms_norm as _k_rms_norm
-    from kernels.fused import rope as _k_rope, swiglu as _k_swiglu
+    from kernels.fused import (
+        rope as _k_rope,
+        swiglu as _k_swiglu,
+        decode_attention as _k_attn,
+    )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = None
 
 
 class _Ready:
@@ -187,6 +191,7 @@ class Engine:
         self.fused_norm = False
         self.fused_rope = False
         self.fused_swiglu = False
+        self.fused_attn = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
     # ------------------------------------------------------------------ rope
@@ -269,23 +274,29 @@ class Engine:
         if not self.cuda:
             self.gqa = False
             return
-        if not self._supports_gqa(batch):
-            self.gqa = False
-            return
+        supports_gqa = self._supports_gqa(batch)
         try:
-            self.gqa = True
-            with_gqa = self._time_decode()
-            self.gqa = False
-            without = self._time_decode()
-            self.gqa = with_gqa <= without
-            print(
-                f"[engine] decode step: enable_gqa {with_gqa:.3f} ms vs repeat_kv "
-                f"{without:.3f} ms -> {'enable_gqa' if self.gqa else 'repeat_kv'}",
-                flush=True,
-            )
+            # Time whole decode steps, not the attention call alone: the fused
+            # kernel also removes the mask build and the output transpose, and
+            # only an end-to-end step prices that in.
+            candidates = []
+            if self.fused_attn:
+                candidates.append(("triton", True, supports_gqa))
+            if supports_gqa:
+                candidates.append(("enable_gqa", False, True))
+            candidates.append(("repeat_kv", False, False))
+
+            timings = []
+            for name, fused, gqa in candidates:
+                self.fused_attn, self.gqa = fused, gqa
+                timings.append((self._time_decode(), name, fused, gqa))
+
+            best_ms, best_name, self.fused_attn, self.gqa = min(timings)
+            summary = ", ".join(f"{n} {ms:.3f} ms" for ms, n, _, _ in timings)
+            print(f"[engine] decode step: {summary} -> {best_name}", flush=True)
         except Exception as exc:  # noqa: BLE001 - timing must never fail a run
-            print(f"[engine] attention timing failed ({exc}); enable_gqa", flush=True)
-            self.gqa = True
+            print(f"[engine] attention timing failed ({exc}); falling back", flush=True)
+            self.fused_attn, self.gqa = False, supports_gqa
         finally:
             self.g_pos.zero_()
 
@@ -361,6 +372,40 @@ class Engine:
         self.fused_norm = verdict["norm"]
         self.fused_rope = verdict["rope"]
         self.fused_swiglu = verdict["swiglu"]
+
+        # Attention is a reduction over keys, so a flash-style streaming order
+        # will not reproduce SDPA bit for bit the way the elementwise kernels
+        # do. Reordering a reduction is explicitly within budget - it is what
+        # separates the reference's own cached and uncached paths - so this one
+        # is held to a tolerance rather than to equality.
+        self.fused_attn = False
+        if _k_attn is not None:
+            try:
+                q = torch.randn(
+                    batch, 1, self.HEADS, self.HEAD_DIM, dtype=self.dtype, device=DEVICE
+                )
+                ck = torch.randn_like(self.cache_k[0])
+                cv = torch.randn_like(self.cache_v[0])
+                probe = torch.tensor([min(7, self.capacity - 1)], dtype=torch.int64, device=DEVICE)
+
+                got = _k_attn(q, ck, cv, probe, self.HEADS, self.KV_HEADS, self.SCALE)
+
+                keep = int(probe.item()) + 1
+                ref = self._sdpa(
+                    q.transpose(1, 2), ck[:, :, :keep, :], cv[:, :, :keep, :], is_causal=False
+                )
+                ref = ref.transpose(1, 2).reshape(batch, 1, self.q_size)
+
+                self.fused_attn = bool(
+                    torch.isfinite(got).all()
+                    and torch.allclose(got.float(), ref.float(), atol=2e-2, rtol=2e-2)
+                )
+                if not self.fused_attn:
+                    delta = (got.float() - ref.float()).abs().max().item()
+                    print(f"[engine] fused attention off, max delta {delta:.3e}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[engine] fused attention unavailable ({exc})", flush=True)
+                self.fused_attn = False
         print(
             f"[engine] fused kernels: norm={self.fused_norm} rope={self.fused_rope} "
             f"swiglu={self.fused_swiglu}",
@@ -394,25 +439,30 @@ class Engine:
         # tensor is still contiguous, which is what lets a fused kernel read it
         # with a single stride instead of a transposed one.
         q, k = self._rope(q, k, cos, sin)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM).transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM).transpose(1, 2)
 
         ck, cv = self.cache_k[layer["idx"]], self.cache_v[layer["idx"]]
         if position is None:
             end = start + tokens
-            ck[:, :, start:end, :] = k
-            cv[:, :, start:end, :] = v
+            ck[:, :, start:end, :] = k_t
+            cv[:, :, start:end, :] = v_t
             keys, values = ck[:, :, :end, :], cv[:, :, :end, :]
         else:
             # A device-side index stays dynamic under graph capture, where a
             # Python slice would be frozen at the captured step.
-            ck.index_copy_(2, position, k)
-            cv.index_copy_(2, position, v)
+            ck.index_copy_(2, position, k_t)
+            cv.index_copy_(2, position, v_t)
             keys, values = ck, cv
 
-        a = self._sdpa(q, keys, values, is_causal=is_causal, attn_mask=mask)
-        a = a.transpose(1, 2).reshape(batch, tokens, self.q_size)
+        if self.fused_attn and position is not None:
+            # Writes [batch, 1, heads * head_dim] directly, which is already
+            # the layout o_proj wants - the SDPA path needs a transpose and a
+            # copy to get there.
+            a = _k_attn(q, ck, cv, position, self.HEADS, self.KV_HEADS, self.SCALE)
+        else:
+            a = self._sdpa(q.transpose(1, 2), keys, values, is_causal=is_causal, attn_mask=mask)
+            a = a.transpose(1, 2).reshape(batch, tokens, self.q_size)
         x = residual + F.linear(a, layer["o"])
 
         residual = x
@@ -470,8 +520,11 @@ class Engine:
 
         # Slots at index <= pos hold real keys; the rest is capacity that was
         # never written. NEG underflows to zero through the softmax.
-        mask = torch.where(self.g_arange <= pos, 0.0, NEG).to(self.dtype)
-        mask = mask.view(1, 1, 1, self.capacity)
+        if self.fused_attn:
+            mask = None  # the kernel reads the length itself; no mask needed
+        else:
+            mask = torch.where(self.g_arange <= pos, 0.0, NEG).to(self.dtype)
+            mask = mask.view(1, 1, 1, self.capacity)
 
         for layer in self.layers:
             x = self._block(

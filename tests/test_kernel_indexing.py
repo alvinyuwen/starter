@@ -68,6 +68,90 @@ def simulate_swiglu(fused):
     return out.reshape(*fused.shape[:-1], inner)
 
 
+def simulate_decode_attention(q, cache_k, cache_v, pos, heads, kv_heads, scale, block_n=64):
+    """Mirror _decode_attn_kernel: one program per (batch, query head), online
+    softmax over cache blocks, length read from `pos`.
+
+    Reproduces the pointer arithmetic and the streaming accumulation, so a
+    wrong KV-head mapping or a mis-strided cache offset shows up here rather
+    than as a failed run.
+    """
+    batch, _, _, head_dim = q.shape
+    capacity = cache_k.shape[2]
+    groups = heads // kv_heads
+    length = int(pos.item()) + 1
+
+    k_flat = cache_k.reshape(-1)
+    v_flat = cache_v.reshape(-1)
+    q_flat = q.reshape(-1)
+    out = torch.empty(batch * heads * head_dim, dtype=torch.float32)
+
+    for pid in range(batch * heads):
+        batch_id = pid // heads
+        head_id = pid % heads
+        kv_head = head_id // groups
+
+        qb = q_flat[(batch_id * heads + head_id) * head_dim:
+                    (batch_id * heads + head_id) * head_dim + head_dim].float()
+        kv_base = (batch_id * kv_heads + kv_head) * capacity * head_dim
+
+        m_i = float("-inf")
+        l_i = 0.0
+        acc = torch.zeros(head_dim, dtype=torch.float32)
+
+        for start in range(0, length, block_n):
+            idx = torch.arange(start, min(start + block_n, length))
+            offs = kv_base + idx[:, None] * head_dim + torch.arange(head_dim)[None, :]
+            k = k_flat[offs.reshape(-1)].reshape(len(idx), head_dim).float()
+            v = v_flat[offs.reshape(-1)].reshape(len(idx), head_dim).float()
+
+            scores = (qb[None, :] * k).sum(dim=1) * scale
+            m_new = max(m_i, float(scores.max()))
+            alpha = torch.tensor(m_i - m_new).exp().item() if m_i != float("-inf") else 0.0
+            p = (scores - m_new).exp()
+            acc = acc * alpha + (p[:, None] * v).sum(dim=0)
+            l_i = l_i * alpha + float(p.sum())
+            m_i = m_new
+
+        out[pid * head_dim:(pid + 1) * head_dim] = acc / l_i
+
+    return out.reshape(batch, 1, heads * head_dim)
+
+
+def check_decode_attention():
+    results = []
+    for batch, heads, kv_heads, head_dim, capacity, pos in [
+        (1, 8, 2, 128, 40, 11),
+        (4, 8, 2, 128, 40, 23),
+        (2, 4, 4, 64, 80, 64),   # no grouping
+        (3, 8, 1, 64, 32, 0),    # single key, single KV head
+    ]:
+        torch.manual_seed(batch * 31 + pos)
+        q = torch.randn(batch, 1, heads, head_dim, dtype=DTYPE)
+        ck = torch.randn(batch, kv_heads, capacity, head_dim, dtype=DTYPE)
+        cv = torch.randn(batch, kv_heads, capacity, head_dim, dtype=DTYPE)
+        p = torch.tensor([pos], dtype=torch.int64)
+        scale = head_dim**-0.5
+
+        got = simulate_decode_attention(q, ck, cv, p, heads, kv_heads, scale)
+
+        keep = pos + 1
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            ck[:, :, :keep, :].repeat_interleave(heads // kv_heads, dim=1),
+            cv[:, :, :keep, :].repeat_interleave(heads // kv_heads, dim=1),
+            scale=scale,
+        )
+        ref = ref.transpose(1, 2).reshape(batch, 1, heads * head_dim)
+
+        ok = torch.allclose(got, ref, atol=1e-4, rtol=1e-4)
+        results.append(ok)
+        print(f"{'PASS' if ok else 'FAIL'}  decode attn b={batch} hq={heads} "
+              f"hkv={kv_heads} d={head_dim} cap={capacity} pos={pos}"
+              f"{'' if ok else f'  maxdiff {(got - ref).abs().max():.3e}'}")
+    return results
+
+
 def main():
     torch.manual_seed(0)
     results = []
@@ -94,6 +178,8 @@ def main():
         ok = torch.allclose(want, got, atol=0, rtol=0)
         results.append(ok)
         print(f"{'PASS' if ok else 'FAIL'}  swiglu indexing rows={rows} inner={inner}")
+
+    results.extend(check_decode_attention())
 
     print()
     if all(results):
