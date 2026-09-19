@@ -313,6 +313,75 @@ def _decode_attn_kernel(
 
 
 @triton.jit
+def _skinny_kernel(
+    x_ptr, w_ptr, out_ptr, M, N, K,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """out[m, n] = sum_k x[m, k] * w[n, k], for a very small M.
+
+    Decode multiplies one to a few token rows against the whole weight matrix,
+    so the cost is reading the weights, not the arithmetic: at batch 1 the
+    model streams 8 GB per step and the measured rate is about a third of what
+    the device can do. This tiles so each program reads one contiguous slab of
+    w exactly once, which is the shape of the problem.
+
+    w is [N, K] and rows are contiguous, matching F.linear's weight layout, so
+    a [BLOCK_N, BLOCK_K] tile is a set of contiguous runs.
+    """
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    n_mask = offs_n < N
+    m_mask = offs_m < M
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+
+        x_tile = tl.load(
+            x_ptr + offs_m[:, None] * K + offs_k[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )
+        w_tile = tl.load(
+            w_ptr + offs_n[:, None] * K + offs_k[None, :],
+            mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+        )
+        # Accumulate in FP32, as cuBLAS does for BF16 inputs. The order of the
+        # sum differs from cuBLAS's, which is a reordering and within budget.
+        acc += tl.dot(x_tile, tl.trans(w_tile), out_dtype=tl.float32)
+
+    tl.store(
+        out_ptr + offs_m[:, None] * N + offs_n[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def skinny_linear(x, weight, block_n=64, block_k=64):
+    """F.linear for a small number of rows, tuned for weight bandwidth."""
+    *lead, k = x.shape
+    rows = 1
+    for d in lead:
+        rows *= d
+    n = weight.shape[0]
+    x2 = x.reshape(rows, k)
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+
+    out = torch.empty(rows, n, dtype=x.dtype, device=x.device)
+    # tl.dot needs at least 16 rows; padding costs arithmetic, not bandwidth,
+    # and bandwidth is the binding constraint here.
+    block_m = max(16, triton.next_power_of_2(rows))
+    _skinny_kernel[(triton.cdiv(n, block_n),)](
+        x2, weight, out, rows, n, k,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        num_warps=4, num_stages=4,
+    )
+    return out.reshape(*lead, n)
+
+
+@triton.jit
 def _kv_cache_kernel(
     qkv_ptr, ck_ptr, cv_ptr, w_ptr, cos_ptr, sin_ptr, pos_ptr,
     tokens, kv_heads, head_dim, half, eps, row_stride, k_offset, v_offset,

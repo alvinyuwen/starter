@@ -43,6 +43,7 @@ try:
     from kernels.fused import (
         add_norm as _k_add_norm,
         kv_to_cache as _k_kv_cache,
+        skinny_linear as _k_skinny,
         rope as _k_rope,
         swiglu as _k_swiglu,
         decode_attention as _k_attn,
@@ -51,7 +52,7 @@ try:
     )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = _k_kv_cache = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = _k_kv_cache = _k_skinny = None
 
 
 class _Ready:
@@ -200,6 +201,7 @@ class Engine:
         self.split_attn = False
         self.fused_add_norm = False
         self.fused_kv_cache = False
+        self.gemm_blocks = None
         self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
@@ -332,6 +334,18 @@ class Engine:
             return _k_rope(q, cos, sin), _k_rope(k, cos, sin)
         return apply_rope(q, k, cos, sin)
 
+    def _linear(self, x, weight):
+        """F.linear, or the bandwidth-tuned kernel when the row count is tiny.
+
+        Only decode qualifies. Prefill multiplies thousands of rows at once,
+        where cuBLAS has real arithmetic intensity to work with and wins
+        comfortably; the skinny kernel exists for the one-to-sixteen row case
+        where the cost is purely streaming the weights.
+        """
+        if self.gemm_blocks is not None and x.shape[0] * x.shape[1] <= 32:
+            return _k_skinny(x, weight, *self.gemm_blocks)
+        return F.linear(x, weight)
+
     def _add_norm(self, residual, delta, weight):
         if self.fused_add_norm:
             return _k_add_norm(residual, delta, weight, self.EPS)
@@ -440,6 +454,7 @@ class Engine:
         # both to match exactly, at a non-zero slot so a hardcoded offset of
         # zero cannot pass.
         self.fused_kv_cache = False
+        self.gemm_blocks = None
         if _k_kv_cache is not None:
             try:
                 ok = True
@@ -485,6 +500,7 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 print(f"[engine] fused kv cache unavailable ({exc})", flush=True)
                 self.fused_kv_cache = False
+        self.gemm_blocks = None
 
         # Attention is a reduction over keys, so a flash-style streaming order
         # will not reproduce SDPA bit for bit the way the elementwise kernels
@@ -550,7 +566,7 @@ class Engine:
         ``positions`` gives each token's cache slot, for the fused writer.
         """
         batch, tokens, _ = n.shape
-        qkv = F.linear(n, layer["qkv"])
+        qkv = self._linear(n, layer["qkv"])
         ck, cv = self.cache_k[layer["idx"]], self.cache_v[layer["idx"]]
         end = None if position is not None else start + tokens
 
@@ -604,8 +620,8 @@ class Engine:
                            is_causal=is_causal, attn_mask=mask)
             a = a.transpose(1, 2).reshape(batch, tokens, self.q_size)
 
-        residual, m = self._add_norm(residual, F.linear(a, layer["o"]), layer["post_ln"])
-        mlp = F.linear(self._swiglu(F.linear(m, layer["gate_up"])), layer["down"])
+        residual, m = self._add_norm(residual, self._linear(a, layer["o"]), layer["post_ln"])
+        mlp = self._linear(self._swiglu(self._linear(m, layer["gate_up"])), layer["down"])
         return self._add_norm(residual, mlp, next_norm_w)
 
     def _forward_prefill(self, ids, seq_len):
@@ -680,7 +696,7 @@ class Engine:
                 positions=pos, position=pos, start=0, mask=mask, is_causal=False,
             )
         x = n
-        token = F.linear(x, self.lm_head_w)[:, -1, :].argmax(dim=-1, keepdim=True)
+        token = self._linear(x, self.lm_head_w)[:, -1, :].argmax(dim=-1, keepdim=True)
 
         # Close the loop inside the captured region: next replay reads this
         # token at this position, with no host involvement.
@@ -720,11 +736,64 @@ class Engine:
         self.g_pos = torch.zeros(1, dtype=torch.int64, device=DEVICE)
         self.g_arange = torch.arange(capacity, dtype=torch.int64, device=DEVICE)
 
-        # Both need the buffers above to exist, and both belong to warmup,
-        # which is untimed: settle the attention path, then capture it.
+        # All three need the buffers above to exist, and all belong to warmup,
+        # which is untimed: settle correctness, then the attention path, then
+        # the matmul tiling, then capture whatever won.
         self._validate_kernels(batch)
         self._select_attention(batch)
+        self._select_gemm()
         self._capture()
+
+    def _select_gemm(self) -> None:
+        """Decide whether the skinny matmul beats cuBLAS, and at which tiling.
+
+        Decode is weight-bandwidth bound - the measured rate barely moves
+        between batch 1 and batch 16 - so this is where the remaining time is.
+        Whether a hand-tiled kernel actually beats a heavily tuned library at
+        these shapes is not something to assume from here, so it is measured,
+        including against leaving it off.
+        """
+        if not self.cuda or _k_skinny is None:
+            self.gemm_blocks = None
+            return
+        try:
+            # Correctness first. A matmul sums thousands of terms, so the order
+            # differs from cuBLAS's and equality is the wrong test; this is the
+            # same reordering budget the attention kernel spends.
+            probe = torch.randn(self.batch, 1, self.HIDDEN, dtype=self.dtype, device=DEVICE)
+            weight = self.layers[0]["qkv"]
+            reference = F.linear(probe, weight)
+            usable = []
+            for block_n, block_k in ((64, 64), (128, 64), (64, 128), (128, 128)):
+                try:
+                    got = _k_skinny(probe, weight, block_n, block_k)
+                except Exception:  # noqa: BLE001 - a tiling that will not compile
+                    continue
+                if torch.isfinite(got).all() and torch.allclose(
+                    got.float(), reference.float(), atol=2e-2, rtol=2e-2
+                ):
+                    usable.append((block_n, block_k))
+            if not usable:
+                print("[engine] skinny matmul rejected on accuracy", flush=True)
+                self.gemm_blocks = None
+                return
+
+            self.gemm_blocks = None
+            timings = [(self._time_decode(), None)]
+            for blocks in usable:
+                self.gemm_blocks = blocks
+                timings.append((self._time_decode(), blocks))
+            best_ms, self.gemm_blocks = min(timings)
+            summary = ", ".join(
+                f"{'cublas' if b is None else f'{b[0]}x{b[1]}'} {ms:.3f} ms" for ms, b in timings
+            )
+            print(f"[engine] decode matmul: {summary} -> "
+                  f"{'cublas' if self.gemm_blocks is None else self.gemm_blocks}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - never let tuning fail a run
+            print(f"[engine] matmul tuning failed ({exc}); cublas", flush=True)
+            self.gemm_blocks = None
+        finally:
+            self.g_pos.zero_()
 
     def _capture(self) -> None:
         """Capture the decode step.
