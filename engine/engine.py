@@ -42,6 +42,7 @@ try:
     from kernels.rmsnorm import rms_norm as _k_rms_norm
     from kernels.fused import (
         add_norm as _k_add_norm,
+        kv_to_cache as _k_kv_cache,
         rope as _k_rope,
         swiglu as _k_swiglu,
         decode_attention as _k_attn,
@@ -50,7 +51,7 @@ try:
     )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = _k_kv_cache = None
 
 
 class _Ready:
@@ -198,6 +199,7 @@ class Engine:
         self.fused_attn = False
         self.split_attn = False
         self.fused_add_norm = False
+        self.fused_kv_cache = False
         self.fused_norm_rope = False
         print(f"[engine] loaded {self.LAYERS} layers; qkv and gate_up fused", flush=True)
 
@@ -433,6 +435,57 @@ class Engine:
         # Both outputs must be right: the sum feeds the next residual.
         self.fused_add_norm = verdict["add_norm"] and verdict["add_norm_sum"]
 
+        # The cache writer returns nothing, so it is judged on what it leaves
+        # behind: run it and the eager chain into separate caches and require
+        # both to match exactly, at a non-zero slot so a hardcoded offset of
+        # zero cannot pass.
+        self.fused_kv_cache = False
+        if _k_kv_cache is not None:
+            try:
+                ok = True
+                for tokens in (1, 5):
+                    qkv = torch.randn(
+                        batch, tokens, self.q_size + 2 * self.kv_size,
+                        dtype=self.dtype, device=DEVICE,
+                    )
+                    cos_t, sin_t = self.cos_table[:tokens], self.sin_table[:tokens]
+                    base = min(3, max(0, self.capacity - tokens - 1))
+                    slots = self.g_arange[base:base + tokens]
+
+                    shape = (batch, self.KV_HEADS, self.capacity, self.HEAD_DIM)
+                    got_k = torch.zeros(shape, dtype=self.dtype, device=DEVICE)
+                    got_v = torch.zeros(shape, dtype=self.dtype, device=DEVICE)
+                    want_k = torch.zeros(shape, dtype=self.dtype, device=DEVICE)
+                    want_v = torch.zeros(shape, dtype=self.dtype, device=DEVICE)
+
+                    _k_kv_cache(
+                        qkv, head_w, cos_t, sin_t, slots, got_k, got_v,
+                        self.KV_HEADS, self.HEAD_DIM, self.EPS,
+                        self.q_size, self.q_size + self.kv_size,
+                    )
+
+                    _, k_ref, v_ref = qkv.split(
+                        [self.q_size, self.kv_size, self.kv_size], dim=-1
+                    )
+                    k_ref = k_ref.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM)
+                    k_ref = apply_rope(
+                        rms_norm(k_ref, head_w, self.EPS),
+                        rms_norm(k_ref, head_w, self.EPS), cos_t, sin_t,
+                    )[0].transpose(1, 2)
+                    v_ref = v_ref.view(
+                        batch, tokens, self.KV_HEADS, self.HEAD_DIM
+                    ).transpose(1, 2)
+                    want_k[:, :, base:base + tokens, :] = k_ref
+                    want_v[:, :, base:base + tokens, :] = v_ref
+
+                    ok &= torch.equal(got_k, want_k) and torch.equal(got_v, want_v)
+                self.fused_kv_cache = bool(ok)
+                if not ok:
+                    print("[engine] fused kv cache write mismatched eager", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[engine] fused kv cache unavailable ({exc})", flush=True)
+                self.fused_kv_cache = False
+
         # Attention is a reduction over keys, so a flash-style streaming order
         # will not reproduce SDPA bit for bit the way the elementwise kernels
         # do. Reordering a reduction is explicitly within budget - it is what
@@ -477,14 +530,14 @@ class Engine:
         print(
             f"[engine] fused kernels: norm={self.fused_norm} rope={self.fused_rope} "
             f"swiglu={self.fused_swiglu} norm_rope={self.fused_norm_rope} "
-            f"add_norm={self.fused_add_norm}",
+            f"add_norm={self.fused_add_norm} kv_cache={self.fused_kv_cache}",
             flush=True,
         )
 
     # --------------------------------------------------------------- forward
 
     def _block(self, residual, n, layer, next_norm_w, cos, sin, *,
-               position, start, mask, is_causal):
+               positions, position, start, mask, is_causal):
         """One decoder layer, taking and returning (residual, pre-normed).
 
         The input arrives already normalised because the previous layer's
@@ -494,40 +547,49 @@ class Engine:
 
         ``position`` is a device index tensor for decode, or ``None`` for
         prefill, where ``start`` gives the absolute offset of this chunk.
+        ``positions`` gives each token's cache slot, for the fused writer.
         """
         batch, tokens, _ = n.shape
-        q, k, v = F.linear(n, layer["qkv"]).split(
-            [self.q_size, self.kv_size, self.kv_size], dim=-1
-        )
-
-        # Per-head RMSNorm over the 128-wide head dimension, before RoPE.
-        # Qwen3 norms q and k; never v.
-        q, k = self._norm_rope_pair(
-            q.view(batch, tokens, self.HEADS, self.HEAD_DIM),
-            k.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM),
-            layer["q_norm"], layer["k_norm"], cos, sin,
-        )
-
-        # RoPE runs here, on [B, T, H, D], rather than after the transpose as
-        # the reference writes it. It is elementwise per (batch, token, head)
-        # row and indexed only by token, so the result is identical - but the
-        # tensor is still contiguous, which is what lets a fused kernel read it
-        # with a single stride instead of a transposed one.
-        k_t = k.transpose(1, 2)
-        v_t = v.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM).transpose(1, 2)
-
+        qkv = F.linear(n, layer["qkv"])
         ck, cv = self.cache_k[layer["idx"]], self.cache_v[layer["idx"]]
-        if position is None:
-            end = start + tokens
-            ck[:, :, start:end, :] = k_t
-            cv[:, :, start:end, :] = v_t
-            keys, values = ck[:, :, :end, :], cv[:, :, :end, :]
+        end = None if position is not None else start + tokens
+
+        if self.fused_kv_cache:
+            # k is normalised, rotated and written to its slot, and v copied to
+            # its own, in one pass - so neither ever becomes a tensor of its
+            # own and the two index_copy_ calls disappear.
+            _k_kv_cache(
+                qkv, layer["k_norm"], cos, sin, positions, ck, cv,
+                self.KV_HEADS, self.HEAD_DIM, self.EPS,
+                self.q_size, self.q_size + self.kv_size,
+            )
+            q = _k_norm_rope(
+                qkv[..., : self.q_size].view(batch, tokens, self.HEADS, self.HEAD_DIM),
+                layer["q_norm"], cos, sin, self.EPS,
+            )
         else:
-            # A device-side index stays dynamic under graph capture, where a
-            # Python slice would be frozen at the captured step.
-            ck.index_copy_(2, position, k_t)
-            cv.index_copy_(2, position, v_t)
-            keys, values = ck, cv
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+            # Per-head RMSNorm over the head dimension, then RoPE. Qwen3 norms
+            # q and k; never v. Both run on [B, T, H, D] rather than after the
+            # transpose as the reference writes it: the operation is per
+            # (batch, token, head) row and indexed only by token, so the values
+            # are identical, but the tensor keeps a stride a kernel can walk.
+            q, k = self._norm_rope_pair(
+                q.view(batch, tokens, self.HEADS, self.HEAD_DIM),
+                k.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM),
+                layer["q_norm"], layer["k_norm"], cos, sin,
+            )
+            k_t = k.transpose(1, 2)
+            v_t = v.view(batch, tokens, self.KV_HEADS, self.HEAD_DIM).transpose(1, 2)
+            if position is None:
+                ck[:, :, start:end, :] = k_t
+                cv[:, :, start:end, :] = v_t
+            else:
+                # A device-side index stays dynamic under graph capture, where
+                # a Python slice would be frozen at the captured step.
+                ck.index_copy_(2, position, k_t)
+                cv.index_copy_(2, position, v_t)
 
         if self.fused_attn and position is not None:
             # Writes [batch, 1, heads * head_dim] directly, which is already
@@ -536,8 +598,12 @@ class Engine:
             fn = _k_attn_split if self.split_attn else _k_attn
             a = fn(q, ck, cv, position, self.HEADS, self.KV_HEADS, self.SCALE)
         else:
-            a = self._sdpa(q.transpose(1, 2), keys, values, is_causal=is_causal, attn_mask=mask)
+            keys = ck if position is not None else ck[:, :, :end, :]
+            values = cv if position is not None else cv[:, :, :end, :]
+            a = self._sdpa(q.transpose(1, 2), keys, values,
+                           is_causal=is_causal, attn_mask=mask)
             a = a.transpose(1, 2).reshape(batch, tokens, self.q_size)
+
         residual, m = self._add_norm(residual, F.linear(a, layer["o"]), layer["post_ln"])
         mlp = F.linear(self._swiglu(F.linear(m, layer["gate_up"])), layer["down"])
         return self._add_norm(residual, mlp, next_norm_w)
@@ -576,7 +642,8 @@ class Engine:
                 nxt = (self.layers[i + 1]["in_ln"] if i + 1 < self.LAYERS
                        else self.final_norm_w)
                 residual, n = self._block(
-                    residual, n, layer, nxt, cos, sin, position=None, start=start,
+                    residual, n, layer, nxt, cos, sin,
+                    positions=self.g_arange[start:stop], position=None, start=start,
                     mask=mask, is_causal=is_causal,
                 )
             hidden = n
@@ -610,7 +677,7 @@ class Engine:
             nxt = self.layers[i + 1]["in_ln"] if i + 1 < self.LAYERS else self.final_norm_w
             residual, n = self._block(
                 residual, n, layer, nxt, cos, sin,
-                position=pos, start=0, mask=mask, is_causal=False,
+                positions=pos, position=pos, start=0, mask=mask, is_causal=False,
             )
         x = n
         token = F.linear(x, self.lm_head_w)[:, -1, :].argmax(dim=-1, keepdim=True)

@@ -313,6 +313,94 @@ def _decode_attn_kernel(
 
 
 @triton.jit
+def _kv_cache_kernel(
+    qkv_ptr, ck_ptr, cv_ptr, w_ptr, cos_ptr, sin_ptr, pos_ptr,
+    tokens, kv_heads, head_dim, half, eps, row_stride, k_offset, v_offset,
+    capacity, HALF_BLOCK: tl.constexpr, D_BLOCK: tl.constexpr,
+):
+    """Normalise and rotate k, copy v, and land both in the cache.
+
+    k and v come from the same fused projection row and end up in the same slot
+    of their respective caches, so the two cache writes and k's
+    normalise-and-rotate become one pass. Writing straight into the slot is
+    what removes the separate index_copy_ for each.
+
+    Programs below kv_heads handle a key head; the rest copy a value head,
+    which Qwen3 never normalises.
+    """
+    row = tl.program_id(0)
+    bt = row // (2 * kv_heads)
+    slot_id = row % (2 * kv_heads)
+    token = bt % tokens
+    batch_id = bt // tokens
+
+    lane = tl.arange(0, D_BLOCK)
+    lane_mask = lane < head_dim
+    out_dtype = ck_ptr.dtype.element_ty
+    slot = tl.load(pos_ptr + token)
+
+    if slot_id < kv_heads:
+        head = slot_id
+        src = bt * row_stride + k_offset + head * head_dim
+        dst = ((batch_id * kv_heads + head) * capacity + slot) * head_dim
+
+        hl = tl.arange(0, HALF_BLOCK)
+        hmask = hl < half
+        lo = tl.load(qkv_ptr + src + hl, mask=hmask, other=0.0)
+        hi = tl.load(qkv_ptr + src + hl + half, mask=hmask, other=0.0)
+
+        f_lo = lo.to(tl.float32)
+        f_hi = hi.to(tl.float32)
+        variance = (tl.sum(f_lo * f_lo, axis=0) + tl.sum(f_hi * f_hi, axis=0)) / head_dim
+        inv = tl.math.rsqrt(variance + eps)
+        n_lo = (f_lo * inv).to(out_dtype) * tl.load(w_ptr + hl, mask=hmask, other=0.0)
+        n_hi = (f_hi * inv).to(out_dtype) * tl.load(w_ptr + hl + half, mask=hmask, other=0.0)
+
+        angle = token * head_dim + hl
+        cos_lo = tl.load(cos_ptr + angle, mask=hmask, other=0.0)
+        sin_lo = tl.load(sin_ptr + angle, mask=hmask, other=0.0)
+        cos_hi = tl.load(cos_ptr + angle + half, mask=hmask, other=0.0)
+        sin_hi = tl.load(sin_ptr + angle + half, mask=hmask, other=0.0)
+
+        a_lo = (n_lo.to(tl.float32) * cos_lo.to(tl.float32)).to(out_dtype)
+        b_lo = ((-n_hi).to(tl.float32) * sin_lo.to(tl.float32)).to(out_dtype)
+        a_hi = (n_hi.to(tl.float32) * cos_hi.to(tl.float32)).to(out_dtype)
+        b_hi = (n_lo.to(tl.float32) * sin_hi.to(tl.float32)).to(out_dtype)
+
+        tl.store(ck_ptr + dst + hl,
+                 (a_lo.to(tl.float32) + b_lo.to(tl.float32)).to(out_dtype), mask=hmask)
+        tl.store(ck_ptr + dst + hl + half,
+                 (a_hi.to(tl.float32) + b_hi.to(tl.float32)).to(out_dtype), mask=hmask)
+    else:
+        head = slot_id - kv_heads
+        src = bt * row_stride + v_offset + head * head_dim
+        dst = ((batch_id * kv_heads + head) * capacity + slot) * head_dim
+        tl.store(cv_ptr + dst + lane,
+                 tl.load(qkv_ptr + src + lane, mask=lane_mask, other=0.0), mask=lane_mask)
+
+
+def kv_to_cache(qkv, weight, cos, sin, positions, cache_k, cache_v,
+                kv_heads, head_dim, eps, k_offset, v_offset):
+    """Write this step's k and v into the cache, k normalised and rotated.
+
+    ``qkv`` is the fused projection ``[batch, tokens, width]``; ``k_offset``
+    and ``v_offset`` locate the k and v blocks inside a row. ``positions`` is a
+    device int64 tensor of length ``tokens`` giving each token's cache slot.
+    """
+    batch, tokens, _ = qkv.shape
+    if not qkv.is_contiguous():
+        qkv = qkv.contiguous()
+    _kv_cache_kernel[(batch * tokens * 2 * kv_heads,)](
+        qkv, cache_k, cache_v, weight, cos, sin, positions,
+        tokens, kv_heads, head_dim, head_dim // 2, eps,
+        qkv.stride(1), k_offset, v_offset, cache_k.shape[2],
+        HALF_BLOCK=triton.next_power_of_2(head_dim // 2),
+        D_BLOCK=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _split_attn_kernel(
     q_ptr, k_ptr, v_ptr, acc_ptr, stat_ptr, pos_ptr,
     heads, kv_heads, capacity, head_dim, groups, scale, splits,
