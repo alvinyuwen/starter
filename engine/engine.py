@@ -44,6 +44,7 @@ try:
         add_norm as _k_add_norm,
         kv_to_cache as _k_kv_cache,
         skinny_linear as _k_skinny,
+        skinny_linear_split as _k_skinny_split,
         rope as _k_rope,
         swiglu as _k_swiglu,
         decode_attention as _k_attn,
@@ -52,7 +53,7 @@ try:
     )
 except Exception as _exc:  # noqa: BLE001
     _kernels_error = _exc
-    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = _k_kv_cache = _k_skinny = None
+    _k_rms_norm = _k_rope = _k_swiglu = _k_attn = _k_norm_rope = _k_attn_split = _k_add_norm = _k_kv_cache = _k_skinny = _k_skinny_split = None
 
 
 class _Ready:
@@ -397,7 +398,10 @@ class Engine:
         if x.shape[0] * x.shape[1] <= 32:
             blocks = self.gemm_choice.get((weight.shape[0], weight.shape[1]))
             if blocks is not None:
-                return _k_skinny(x, weight, *blocks)
+                *tile, splits = blocks
+                if splits > 1:
+                    return _k_skinny_split(x, weight, *tile, splits)
+                return _k_skinny(x, weight, *tile)
         return F.linear(x, weight)
 
     def _add_norm(self, residual, delta, weight):
@@ -855,13 +859,18 @@ class Engine:
             probe = torch.randn(self.batch, 1, self.HIDDEN, dtype=self.dtype, device=DEVICE)
             reference = F.linear(probe, self.layers[0]["qkv"])
             usable = []
-            grid = [(bn, bk, w, st)
-                    for bn in (64, 128) for bk in (64, 128)
-                    for w in (4, 8) for st in (3,)]
+            # splits > 1 spreads a narrow output over more programs; splits
+            # of 1 is the single-pass kernel. Kept small so the whole search,
+            # including Triton compiling each variant, fits the load budget.
+            grid = [(bn, 64, w, 3, sp)
+                    for bn in (64, 128) for w in (4, 8) for sp in (1, 8)]
             for blocks in grid:
                 try:
-                    got = _k_skinny(probe, self.layers[0]["qkv"], *blocks)
-                except Exception:  # noqa: BLE001 - a tiling that will not compile
+                    *tile, splits = blocks
+                    got = (_k_skinny_split(probe, self.layers[0]["qkv"], *tile, splits)
+                           if splits > 1
+                           else _k_skinny(probe, self.layers[0]["qkv"], *tile))
+                except Exception:  # noqa: BLE001 - a variant that will not compile
                     continue
                 if torch.isfinite(got).all() and torch.allclose(
                     got.float(), reference.float(), atol=2e-2, rtol=2e-2

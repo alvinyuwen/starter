@@ -392,6 +392,97 @@ def skinny_linear(x, weight, block_n=64, block_k=64, num_warps=4, num_stages=4):
 
 
 @triton.jit
+def _skinny_split_kernel(
+    x_ptr, w_ptr, part_ptr, M, N, K, splits,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """Partial matmul over one slice of K, for narrow output matrices.
+
+    A weight only 2560 wide gives 40 programs at BLOCK_N=64, which leaves most
+    of the device idle and caps the bandwidth those programs can pull. o_proj
+    and down_proj are both that shape and together are a third of the weight
+    traffic per layer, so splitting K is what puts the rest of the SMs to work.
+
+    Partials are written per split and summed by a second pass - deterministic,
+    unlike accumulating into one buffer with atomics, which would vary between
+    replays and put the sample-spread gate at risk.
+    """
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    n_mask = offs_n < N
+    m_mask = offs_m < M
+
+    per_split = tl.cdiv(K, splits)
+    k_begin = pid_k * per_split
+    k_end = tl.minimum(k_begin + per_split, K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(k_begin, k_end, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < k_end
+        x_tile = tl.load(
+            x_ptr + offs_m[:, None] * K + offs_k[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )
+        w_tile = tl.load(
+            w_ptr + offs_n[:, None] * K + offs_k[None, :],
+            mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+            eviction_policy="evict_first",
+        )
+        acc += tl.dot(x_tile, tl.trans(w_tile), out_dtype=tl.float32)
+
+    base = pid_k * M * N
+    tl.store(
+        part_ptr + base + offs_m[:, None] * N + offs_n[None, :], acc,
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+@triton.jit
+def _reduce_splits_kernel(part_ptr, out_ptr, M, N, splits, BLOCK: tl.constexpr):
+    """Sum the per-split partials in a fixed order, then cast once."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < M * N
+
+    total = tl.zeros([BLOCK], dtype=tl.float32)
+    for s in range(0, splits):
+        total += tl.load(part_ptr + s * M * N + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + offs, total.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def skinny_linear_split(x, weight, block_n=64, block_k=64, num_warps=4,
+                        num_stages=3, splits=8):
+    """skinny_linear with the K dimension spread across more programs."""
+    *lead, k = x.shape
+    rows = 1
+    for d in lead:
+        rows *= d
+    n = weight.shape[0]
+    x2 = x.reshape(rows, k)
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+
+    block_m = max(16, triton.next_power_of_2(rows))
+    part = torch.empty(splits, rows, n, dtype=torch.float32, device=x.device)
+    _skinny_split_kernel[(triton.cdiv(n, block_n), splits)](
+        x2, weight, part, rows, n, k, splits,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+    out = torch.empty(rows, n, dtype=x.dtype, device=x.device)
+    block = 1024
+    _reduce_splits_kernel[(triton.cdiv(rows * n, block),)](
+        part, out, rows, n, splits, BLOCK=block, num_warps=4,
+    )
+    return out.reshape(*lead, n)
+
+
+@triton.jit
 def _kv_cache_kernel(
     qkv_ptr, ck_ptr, cv_ptr, w_ptr, cos_ptr, sin_ptr, pos_ptr,
     tokens, kv_heads, head_dim, half, eps, row_stride, k_offset, v_offset,

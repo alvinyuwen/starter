@@ -278,6 +278,49 @@ def check_split_attention():
     return results
 
 
+def simulate_split_matmul(x, w, splits, block_n=64):
+    """Mirror _skinny_split_kernel + _reduce_splits_kernel.
+
+    The partitioning is ceiling division over K, so the last split takes a
+    short remainder and, when splits exceed K blocks, some splits own nothing
+    at all. Those have to contribute exactly zero rather than reading past the
+    end or double-counting.
+    """
+    rows, k = x.shape
+    n = w.shape[0]
+    per_split = -(-k // splits)
+    part = torch.zeros(splits, rows, n, dtype=torch.float32)
+
+    for pid_k in range(splits):
+        begin = pid_k * per_split
+        end = min(begin + per_split, k)
+        if end <= begin:
+            continue
+        part[pid_k] = x[:, begin:end].float() @ w[:, begin:end].float().T
+
+    return part.sum(0)
+
+
+def check_split_matmul():
+    results = []
+    for rows, n, k, splits in [(1, 2560, 9728, 8), (16, 6144, 2560, 8),
+                               (4, 2560, 4096, 4), (1, 64, 64, 8),
+                               (2, 128, 5, 8)]:  # more splits than K: empty splits
+        torch.manual_seed(rows * 17 + k)
+        x = torch.randn(rows, k, dtype=DTYPE)
+        w = torch.randn(n, k, dtype=DTYPE)
+
+        got = simulate_split_matmul(x, w, splits)
+        ref = torch.nn.functional.linear(x, w).float()
+
+        ok = torch.allclose(got, ref, atol=1e-3, rtol=1e-3)
+        results.append(ok)
+        print(f"{'PASS' if ok else 'FAIL'}  split matmul rows={rows} n={n} k={k} "
+              f"splits={splits}"
+              f"{'' if ok else f'  maxdiff {(got - ref).abs().max():.3e}'}")
+    return results
+
+
 def check_decode_attention():
     results = []
     for batch, heads, kv_heads, head_dim, capacity, pos in [
@@ -342,6 +385,7 @@ def main():
     results.extend(check_norm_rope())
     results.extend(check_decode_attention())
     results.extend(check_split_attention())
+    results.extend(check_split_matmul())
 
     print()
     if all(results):
